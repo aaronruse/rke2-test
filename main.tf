@@ -109,22 +109,18 @@ module "rke2" {
   pre_userdata = <<-EOF
     #!/bin/bash
     set -euo pipefail
+
     # Disable password auth and root login
     sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
     sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
     systemctl restart ssh || systemctl restart sshd
 
-    # Ubuntu 24.04 + RKE2 1.26 compatibility: ensure cgroup v2 is supported
-    # and required kernel modules are loaded
-    modprobe overlay
-    modprobe br_netfilter
+    # Kernel modules and sysctl for RKE2
+    modprobe overlay || true
+    modprobe br_netfilter || true
     printf 'net.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward = 1\n' > /etc/sysctl.d/99-kubernetes.conf
-    net.bridge.bridge-nf-call-iptables  = 1
-    net.bridge.bridge-nf-call-ip6tables = 1
-    net.ipv4.ip_forward                 = 1
-    SYSCTL
-    sysctl --system
+    sysctl -p /etc/sysctl.d/99-kubernetes.conf
   EOF
 
   # Security group additions — allow workers and bastion to communicate with CP
@@ -199,20 +195,18 @@ module "rke2_workers" {
   pre_userdata = <<-EOF
     #!/bin/bash
     set -euo pipefail
+
+    # Disable password auth and root login
     sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
     sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
     systemctl restart ssh || systemctl restart sshd
 
-    # Ubuntu 24.04 + RKE2 1.26 compatibility
-    modprobe overlay
-    modprobe br_netfilter
+    # Kernel modules and sysctl for RKE2
+    modprobe overlay || true
+    modprobe br_netfilter || true
     printf 'net.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward = 1\n' > /etc/sysctl.d/99-kubernetes.conf
-    net.bridge.bridge-nf-call-iptables  = 1
-    net.bridge.bridge-nf-call-ip6tables = 1
-    net.ipv4.ip_forward                 = 1
-    SYSCTL
-    sysctl --system
+    sysctl -p /etc/sysctl.d/99-kubernetes.conf
   EOF
 
   # Security group additions — attach worker SG

@@ -113,13 +113,13 @@ module "rke2" {
     sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
     sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
-    systemctl restart sshd
+    systemctl restart ssh || systemctl restart sshd
 
     # Ubuntu 24.04 + RKE2 1.26 compatibility: ensure cgroup v2 is supported
     # and required kernel modules are loaded
     modprobe overlay
     modprobe br_netfilter
-    cat > /etc/sysctl.d/99-kubernetes.conf <<SYSCTL
+    printf 'net.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward = 1\n' > /etc/sysctl.d/99-kubernetes.conf
     net.bridge.bridge-nf-call-iptables  = 1
     net.bridge.bridge-nf-call-ip6tables = 1
     net.ipv4.ip_forward                 = 1
@@ -202,12 +202,12 @@ module "rke2_workers" {
     sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
     sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
-    systemctl restart sshd
+    systemctl restart ssh || systemctl restart sshd
 
     # Ubuntu 24.04 + RKE2 1.26 compatibility
     modprobe overlay
     modprobe br_netfilter
-    cat > /etc/sysctl.d/99-kubernetes.conf <<SYSCTL
+    printf 'net.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward = 1\n' > /etc/sysctl.d/99-kubernetes.conf
     net.bridge.bridge-nf-call-iptables  = 1
     net.bridge.bridge-nf-call-ip6tables = 1
     net.ipv4.ip_forward                 = 1

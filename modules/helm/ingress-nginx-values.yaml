@@ -1,0 +1,68 @@
+# ============================================================
+# ingress-nginx Helm Values
+# Deploys the NGINX ingress controller on worker nodes only.
+# The AWS application NLB (deployed via Terraform) routes
+# port 80/443 to the NodePort exposed by this controller.
+# ============================================================
+
+controller:
+  # Pin to worker nodes only via nodeSelector
+  nodeSelector:
+    node-role.kubernetes.io/worker: "true"
+
+  # Replica count — spread across all 4 workers
+  replicaCount: 4
+
+  # Use NodePort service type — the Terraform NLB target groups
+  # point directly to these NodePorts on the worker EC2 instances.
+  service:
+    type: NodePort
+    nodePorts:
+      http: 80
+      https: 443
+
+  # Preserve client source IP through the NLB
+  config:
+    use-forwarded-headers: "true"
+    compute-full-forwarded-for: "true"
+    use-proxy-protocol: "false"  # AWS NLB TCP mode — no PROXY protocol
+
+  # Resource requests/limits for t3.xlarge workers
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+
+  # PodDisruptionBudget — keep at least 3 healthy during node churn
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 3
+
+  # Tolerate control plane taints (not needed here, but safe to include)
+  tolerations: []
+
+  # Affinity: spread replicas across nodes
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: ingress-nginx
+
+  # Metrics (optional — uncomment if you deploy Prometheus)
+  # metrics:
+  #   enabled: true
+  #   serviceMonitor:
+  #     enabled: true
+
+defaultBackend:
+  enabled: true
+  replicaCount: 2
+  nodeSelector:
+    node-role.kubernetes.io/worker: "true"

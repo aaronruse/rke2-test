@@ -1,0 +1,275 @@
+Hi Claude, I think I need to use this repo for a project: https://github.com/rancherfederal/rke2-aws-tf. Can you tell me what this repo does and it's purpose?
+Your role for this whole conversation is a Sr Software Engineer with 25+ years of experience.
+
+Good repo — I know this one well. Let me break it down for you.
+
+## What is `rke2-aws-tf`?
+
+This is a **Terraform module** maintained by Rancher Federal that automates the deployment of **RKE2 (Rancher Kubernetes Engine 2)** clusters on AWS. Think of it as infrastructure-as-code that handles the heavy lifting of standing up a production-grade Kubernetes cluster in your AWS environment.
+
+### What is RKE2?
+
+RKE2 is Rancher's second-generation Kubernetes distribution, designed with a strong focus on **security and compliance** — particularly for government and federal use cases (hence "Rancher Federal" as the maintainer). It's hardened against CIS Kubernetes benchmarks out of the box and is notably lightweight compared to other enterprise Kubernetes distributions.
+
+### What does this module actually provision?
+
+The repo provisions RKE2 in a highly available, resilient, and scalable manner on AWS. Concretely, when you `terraform apply` this, you get:
+
+- **AWS Auto Scaling Groups (ASGs)** — both server (control plane) nodes and agent (worker) nodes self-bootstrap and auto-join the cluster via userdata scripts, with no SSH required
+- **An AWS Network Load Balancer (NLB)** — provides a static endpoint for the Kubernetes control plane
+- **S3 bucket** — used as a secure secrets store for the cluster join token (instead of baking it into userdata)
+- **IAM roles and policies** — minimum-privilege roles for nodes to fetch tokens, optionally upload kubeconfig, and support the AWS Cloud Controller Manager or Cluster Autoscaler
+
+### The two modules you'll work with
+
+The repo exposes two primary Terraform modules: the root `rke2` module which provisions the control plane load balancer and server nodepool, and the `agent-nodepool` module which creates worker ASGs that auto-join the cluster.
+
+### Why it's designed the way it is
+
+Since it's bad practice to store sensitive information in userdata, S3 is used as a secure secrets store for the cluster join token. Nodes boot, pull the token from S3 via the AWS CLI, and join the cluster — clean, auditable, and no secrets in plain text.
+
+### Things to be aware of before you use it
+
+A few things I'd flag from experience:
+
+1. **Breaking changes in March 2023** — the `rke2` user is no longer installed by default, cloud-init scripts were renumbered, and the `asg` variable now requires a `termination_policy` value. If you're working from older examples or docs, watch for this.
+2. **Requires Terraform >= 1.3 and AWS provider >= 5.32** — make sure your toolchain is current.
+3. **It's a starting point, not a final solution** — the modules are intended as stepping stones for solutions that meet your workflow and organization's needs. You'll almost certainly need to extend it.
+
+---
+
+What's your use case? Are you standing up a fresh cluster from scratch, integrating it into existing infrastructure, or looking at something like air-gapped or GovCloud deployment? That'll help me point you toward the right examples in the repo.
+
+We will be standing up fresh cluster from scratch with the below requirements:
+* 1 control planes with 4 worker nodes
+* a load balancer that sits in front of the worker nodes to the application workload
+* config a simple but secure way to access the control plane, using the Bastion provided in this repo, we do not want the control plane to be publicly assessable
+* deploy the control plane and worker node into 2 different subnets that can access each other
+* follow the specifications in the repo for deploying any applications defined in the repo, but for any additional applications you want to use please use a helm deployment
+* please use 10.96.0.0/12 for the service subnet and 169.254.0.0/16 for the pod subnet.
+* please use 10.0.0.0/16 as the VPC subnet
+* the control plane should be normal instances running c5.2xlarge
+* the worker nodes should be t3.xlarge
+* use Elastic IPs where ever needed
+* please use the CIS hardened images mentioned in the repo
+* please make it so all the nodes can be accessed via SSH and ssh-key, but disable ssh password access
+* RKE2 1.26 
+* If possible use Ubuntu 24.04 CIS hardened
+* please add 350 GB storage drive under each work nodes
+* please add 200 GB storage drive under the control plane
+
+Also once the cluster(s) is deployed, we would like to use coreDNS to setup and establish DNS with a set of instructions how to use this configuration to setup public ingress/egress to the workload applications running on the 4 worker nodes. 
+
+Please use industry standards and best practices for the above request. If any requirements above deviate from these standards and best practices please let me know.
+
+Good — I have everything I need. Let me now build this out comprehensively. This is a significant piece of infrastructure so I'll produce a complete, well-structured Terraform project.
+
+Before I dive in, let me flag a few important notes upfront:
+
+**⚠️ Deviations & Recommendations from Industry Standards:**
+
+1. **Single control plane node** — You requested 1 control plane. Industry standard for production is **3 control plane nodes** (etcd quorum requires odd numbers ≥3). With 1, you lose HA and any node failure takes down the cluster. I'll build it as requested but strongly recommend 3 for any production workload. I'll make it easy to change.
+2. **RKE2 1.26** — This version reached end-of-life. The last 1.26 patch was `v1.26.15+rke2r1`. I'll use it as requested but flag it — you should plan migration to 1.28+ soon.
+3. **169.254.0.0/16 for pod subnet** — This is the link-local range and is technically valid for overlay networks in RKE2/Canal, but it's unconventional. Standard practice uses `10.42.0.0/16`. I'll honor your request but document it.
+4. **Elastic IPs on ASG-managed nodes** — EIPs and ASGs don't pair well natively. I'll use them on the Bastion (which is a standalone instance), and for workers behind an NLB (EIPs on NLB are the correct pattern). Control plane nodes in an ASG use the internal NLB — no public EIPs needed there.
+5. **Ubuntu 24.04 + RKE2 1.26** — There's a compatibility risk here. RKE2 1.26 was built against older kernels. Ubuntu 24.04 uses kernel 6.8 which may cause issues. I'll include a compatibility note and a workaround in userdata.
+
+Now let me build the full project.Now let's create the Helm deployments and CoreDNS configuration:Now let me write the key remaining files quickly and then package everything:
+
+Here's the complete project — 19 files across Terraform, Helm, and documentation. Let me walk you through what was built and the key decisions made.
+
+---
+
+## What's in the Project
+
+**Terraform (infrastructure layer):**
+- `networking.tf` — Full VPC (10.0.0.0/16) with 3 subnets (bastion/public, control-plane/private, workers/private), IGW, NAT Gateway, route tables, and 3 Elastic IPs (bastion, NAT, app NLB)
+- `security_groups.tf` — Least-privilege SGs for bastion (SSH only), control plane (RKE2 ports, no public access), and workers (NodePort 80/443 from NLB, SSH from bastion only)
+- `main.tf` — Wires the `rancherfederal/rke2-aws-tf` server and agent modules together with the app-facing NLB, target groups, and ASG attachments
+- `modules/bastion/` — Standalone EC2 bastion with hardened SSH userdata (password auth disabled, root login disabled, agent forwarding enabled)
+
+**Helm (application layer):**
+- `deploy.sh` — Idempotent script deploying cert-manager → ingress-nginx → CoreDNS patch in the correct dependency order
+- `ingress-nginx-values.yaml` — NodePort mode (TCP passthrough to the NLB), 4 replicas with pod anti-affinity across workers, PodDisruptionBudget of min 3
+- `cert-manager-values.yaml` — Let's Encrypt integration for automatic TLS
+- `coredns-helmchart-patch.yaml` — Patches RKE2's built-in CoreDNS (correct approach — RKE2 owns it via a HelmChart CR, you don't deploy a second one)
+
+**Docs:**
+- `docs/deployment-guide.md` — Full runbook from AMI subscription through SSH tunnel setup to upgrade path
+- `docs/coredns-guide.md` — DNS architecture, Route 53 setup, step-by-step Ingress + TLS examples, troubleshooting table
+
+---
+
+## The Three Things You Need to Do Before Running
+
+1. **Subscribe to the CIS Ubuntu 24.04 AMI** at the marketplace link in `deployment-guide.md`, then look up the AMI ID for your region and drop it in `terraform.tfvars`
+2. **Restrict the bastion SSH source CIDR** in `security_groups.tf` from `0.0.0.0/0` to your org's egress IP — this is the single most important security action before going live
+3. **Set your SSH public key path** in `terraform.tfvars` — everything flows from that one key
+
+The `docs/deployment-guide.md` and `docs/coredns-guide.md` files are where I'd start reading — they cover the full flow from zero to working HTTPS ingress.
+
+Quick question, did we use the repo (__https://github.com/rancherfederal/rke2-aws-tf__) for the previous request? So we will be able to use this repo to keep our configuration up to date?
+
+Yes, we did use the repo — but let me be precise about **how** and **where**, because there's an important nuance.
+
+## What We Used From the Repo
+
+In `main.tf`, the two core RKE2 modules are sourced directly from it:
+
+```hcl
+module "rke2" {
+  source = "git::https://github.com/rancherfederal/rke2-aws-tf.git?ref=v2.5.1"
+  ...
+}
+
+module "rke2_workers" {
+  source = "git::https://github.com/rancherfederal/rke2-aws-tf.git//modules/agent-nodepool?ref=v2.5.1"
+  ...
+}
+```
+
+So yes — the control plane provisioning, ASG bootstrap logic, S3 token store, IAM policies, internal NLB, and userdata scripts all come directly from that repo pinned to `v2.5.1`.
+
+## What We Built Ourselves (Outside the Repo)
+
+The following were **custom** because the repo doesn't provide them:
+
+- The entire VPC, subnets, NAT Gateway, EIPs, and route tables (`networking.tf`)
+- The bastion host module (`modules/bastion/`)
+- Security groups (`security_groups.tf`)
+- The application-facing NLB for worker traffic (`main.tf` — lower half)
+- All Helm charts and deployment scripts
+
+## Staying Up to Date With the Repo
+
+This is where you need to be deliberate. Because we pinned to `?ref=v2.5.1`, you are **protected from surprise breaking changes** but you also won't automatically get fixes or improvements. Here's how to track it properly:
+
+**To check for new releases:**
+```bash
+# Watch the repo for new releases on GitHub
+# Or check programmatically:
+git ls-remote --tags https://github.com/rancherfederal/rke2-aws-tf.git
+```
+
+**To upgrade to a new version**, update the ref in both module sources in `main.tf`:
+```hcl
+# Change v2.5.1 to the new release tag, e.g. v2.6.0
+source = "git::https://github.com/rancherfederal/rke2-aws-tf.git?ref=v2.6.0"
+```
+
+Then run:
+```bash
+terraform init -upgrade   # re-downloads the new module version
+terraform plan            # review what changes — read this carefully
+terraform apply
+```
+
+## One Thing to Watch For
+
+The repo's changelog (which we saw earlier) noted breaking changes in March 2023 around cloud-init script numbering and the `asg` variable structure. When a new release comes out, **always read the release notes before upgrading** — this isn't a passive "pull and apply" situation. Changes to userdata ordering, IAM policies, or module variable signatures will require review before you apply them to a running cluster.
+
+The short answer: yes, the repo is your upstream for the RKE2 core, and the pinned `ref=` tag gives you a controlled, auditable path to stay current with it.
+
+Can you alter the quick start to include the steps to deploy the bastion server first? I would like to check this code base out locally on my windows machine, deploy the bastion, and then check this code base out again on the bastion so I can then deploy the RKE2 cluster. Also check the code base out on the bastion for me and use the same key I use locally to clone the git repo to my windows machine.
+
+A few quick clarifying questions before I update the guide:The user hasn't responded yet, but I can see their question clearly implies a specific workflow. Let me wait for their selections — though actually looking at the tool output, it seems the widget was presented but no response came through. Let me re-read their request more carefully.
+
+They said "use the same key I use locally to clone the git repo to my windows machine" — meaning the SSH key used for Git on Windows should also be the key forwarded to the bastion for Git access there. I have enough to work with. Let me ask just the two things I genuinely can't infer:It looks like the response widget may not have come back — go ahead and just tell me in text which Git host and which terminal you use on Windows (PowerShell, WSL2, or Git Bash) and I'll get the updated guide built right away.
+
+Q: Where is the code hosted? (This determines the git clone command and credential approach)
+A: GitLab
+
+Q: What SSH key type did you generate (or plan to use) for Git access on your Windows machine?
+A: Ed25519 (recommended)
+
+Q: How do you run commands on your Windows machine?
+A: PowerShell
+
+Now I have everything I need. I'll rewrite both files — the README Quick Start and the full deployment guide — to reflect the two-phase deploy workflow with Windows/PowerShell/GitLab specifics throughout.Now rewrite the full deployment guide:Both files are updated. Here's a summary of what changed and the key design decisions behind the approach:
+
+**What was updated:**
+
+The README Quick Start and the full deployment guide were both rewritten around a clear two-phase model, with all commands converted to PowerShell syntax (backtick line continuation, `$env:USERPROFILE`, `Invoke-WebRequest`, `Get-Content`/`Set-Content`, etc.).
+
+**The key design behind the SSH key strategy:**
+
+Your single Ed25519 key does triple duty — GitLab auth on Windows, GitLab auth on the bastion (via forwarding), and SSH access to all EC2 nodes. The critical point is that `ssh -A` forwards your Windows `ssh-agent` socket into the remote session. The bastion literally has no private key file — when it runs `git clone git@gitlab.com:...`, it reaches back through the forwarded socket to your Windows machine to sign the challenge. This is the correct and secure pattern; copying private keys to servers is an anti-pattern we deliberately avoided.
+
+**The `-A` flag is the linchpin of Phase 2** — if the agent isn't running on Windows or the key isn't loaded before you SSH, Phase 2's GitLab clone step will fail with a permission denied. Steps 3 and 11 both call this out explicitly with recovery instructions.
+
+**One thing to do once before anything else:** run the two Administrator PowerShell lines in Step 3 to set the `ssh-agent` service to `Automatic` startup. Without that, the agent won't survive a reboot and you'll wonder why `ssh-add` isn't persisting.
+
+Q: Would you like to enable spot instances on the worker nodes?
+A: Yes — enable spot to reduce cost
+
+
+Three changes needed: add `spot = true` to the worker module, allow the ASG max to flex above 4 so AWS can replace interrupted instances, and add a `spot` variable with a toggle to `variables.tf`. I'll also update `terraform.tfvars` to document it clearly.Now update the termination policy line in the same module — it currently says `["Default"]` but we want the smarter policy for spot:Now add the `worker_spot` variable to `variables.tf`:Now document it clearly in `terraform.tfvars`:Now verify the final state of the three changed files looks correct:All three files look correct.Three files updated. Here's exactly what changed and why each decision was made:
+
+**`main.tf` — worker module**
+
+`spot = var.worker_spot` was added, enabling the spot market request in the ASG launch template. The ASG `max` was also changed from `worker_count` to `worker_count + 2` (i.e. 6). This is important — without that headroom, when AWS reclaims a spot node the ASG is already at its maximum and can't launch a replacement until the interrupted instance fully terminates, creating a brief capacity gap. The +2 buffer lets new nodes come up before old ones go down. The termination policy was also updated from `["Default"]` to `["OldestLaunchTemplate", "Default"]`, which ensures that if a mix of instance generations exist in the ASG (common after a config change), older ones are retired first.
+
+**`variables.tf`** — added `worker_spot` as a `bool` defaulting to `true`.
+
+**`terraform.tfvars`** — `worker_spot = true` is now explicit and documented.
+
+**One thing to be aware of operationally**: when a spot node is reclaimed, your pods on that node will be evicted and rescheduled. The PodDisruptionBudget of `minAvailable: 3` on ingress-nginx (set in the Helm values) means Kubernetes will ensure at least 3 ingress-nginx pods stay healthy during the churn. For your own application workloads, you should set similar PDBs and ensure `replicas >= 2` so no single spot reclamation takes an app fully offline. If you want to revert to On-Demand at any time, just set `worker_spot = false` in `terraform.tfvars` and run `terraform apply`.
+
+is there a user that will exist on the control plane and work nodes that I can use my ssh key to login to? if so what is it called?
+
+Yes — the user is **`ubuntu`**.
+
+This comes from two places working together:
+
+1. **The CIS Hardened Ubuntu 24.04 AMI** — Ubuntu-based AMIs always provision a default `ubuntu` user, and the CIS hardened image from the AWS Marketplace preserves this convention.
+
+2. **The `ssh_authorized_keys` variable** in the `rancherfederal/rke2-aws-tf` module — when you pass your public key via `ssh_authorized_keys = [local.ssh_public_key]`, the module's userdata injects it into the `ubuntu` user's `~/.ssh/authorized_keys` file on every node.
+
+So the SSH commands you'd use from the bastion are:
+
+```bash
+# Control plane node
+ssh ubuntu@10.0.1.X
+
+# Worker node
+ssh ubuntu@10.0.2.X
+```
+
+And from your Windows machine to the bastion itself (which uses the same AMI and the same key injection):
+
+```powershell
+ssh -A ubuntu@$BASTION_IP
+```
+
+**One thing to note**: the `ubuntu` user has passwordless `sudo` on Ubuntu AMIs, which is standard. The CIS hardening does not remove this but it does lock down direct root login (`PermitRootLogin no`) and password authentication (`PasswordAuthentication no`), both of which we explicitly reinforce in the `pre_userdata` scripts. So `ubuntu` with your SSH key is the one and only entry point into every node in the cluster.
+
+I changed my mind. Can you make this entire deployment, including the deployment of the bastion, something that can be run from a RHEL 8 AWS workspace?
+
+A few quick questions before I update everything:
+Q: What is the AWS Workspace running — a full RHEL 8 desktop or just a RHEL 8 terminal/SSH session?
+A: RHEL 8 terminal / SSH session only
+
+Q: How should the deployment script install tools like Terraform, kubectl, and Helm if they are missing?
+A: Auto-install them as part of the script
+
+Q: Should the GitLab SSH key setup steps be kept (same Ed25519 key, same two-phase clone workflow), just adapted for RHEL 8?
+A: No — drop the two-phase approach, deploy everything in one shot from the workspace
+
+Good — clean single-phase deployment from the RHEL 8 workspace. I'll rewrite the deployment guide, replace the Windows/PowerShell commands throughout, add a bootstrap script that auto-installs all tools, and update the README. The `main.tf` and Terraform code itself doesn't change — only the operator workflow does.Good — I have the full picture. Now I'll write the bootstrap script, rewrite both docs, and update the README quick start.Now rewrite the README Quick Start:Now update the File Structure section in the README to include the new scripts directory:Also update the Prerequisites note in the README important notes section:Final check — verify all files look right:Everything looks correct.Three files updated, one new file added. Here's a summary of what changed and the key decisions:
+
+**What changed:**
+
+The two-phase Windows/PowerShell workflow is gone. The entire deployment — bastion included — now runs as a single `terraform apply` directly from the RHEL 8 workspace. All PowerShell syntax (`$env:USERPROFILE`, backtick continuations, `Invoke-WebRequest`, etc.) has been replaced with standard bash.
+
+**`scripts/bootstrap-rhel8.sh` — new file, run this first:**
+This is the entry point. It uses `dnf` to install system packages, downloads AWS CLI v2, Terraform, kubectl, and Helm from their official sources, and handles each tool idempotently — meaning it checks if a tool is already installed before touching it, so it's safe to re-run. It also generates the Ed25519 SSH key, starts `ssh-agent`, loads the key, and prints a summary of everything installed plus your AWS caller identity. On RHEL 8 specifically, `apt` doesn't exist so everything that can't come from `dnf` is fetched as a binary and installed to `/usr/local/bin` via `install -m 0755` — the standard Linux pattern.
+
+**Deployment guide** — fully rewritten for RHEL 8 single-phase, with a proxy setup note at the top (important since AWS Workspaces in enterprise environments often have egress proxies), an `~/.bashrc` snippet to auto-reload the ssh-agent on reconnect (a common pain point in workspace environments where sessions disconnect), and an expanded troubleshooting table covering RHEL 8-specific scenarios.
+
+**One practical tip**: the `~/.bashrc` snippet in Step "Keeping the SSH Agent Alive" in the deployment guide is worth adding right after the bootstrap — workspace terminal sessions disconnect frequently and having to manually re-run `ssh-add` every time is the most common friction point in this kind of environment.
+
+it appears that file called coredns-values.yaml is missing can you please reproduce it for me?
+The file is actually still there in the project — it may not have been included in the last set of files presented to you. Here it is:The file was already present in the project — it just hadn't been re-presented after the last few rounds of changes. There's nothing missing from the content itself.
+
+One thing worth keeping in mind about this file: as noted in the comment at the top, RKE2 manages its own CoreDNS instance internally via a `HelmChart` custom resource in the `kube-system` namespace. This `coredns-values.yaml` is a reference/standalone values file, but the actual way to apply these settings to the RKE2-managed CoreDNS is through the `coredns-helmchart-patch.yaml` file, which `helm/deploy.sh` applies via `kubectl patch`. You don't run `helm install` against this file directly — the patch file is what does the real work at deploy time.
+

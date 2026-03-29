@@ -37,6 +37,7 @@ worker_disk_size_gb         = 350
 # ------- AMI -------
 # Subscribe to CIS Hardened Ubuntu 24.04 Level 1 in AWS Marketplace first:
 # https://aws.amazon.com/marketplace/pp/prodview-6l5e56nst6r3g
+# here is the CIS AMI=ami-004ca9c8986f68ab5
 # Then replace this with the AMI ID for your region:
 ami_id = "ami-0d76b909de1a0595d"
 
@@ -45,7 +46,7 @@ ssh_public_key_path = "~/.ssh/rke2_id_ed25519.pub"
 
 # ------- Kubernetes Networking -------
 pod_cidr     = "10.42.0.0/16"
-service_cidr = "10.96.0.0/12"
+service_cidr = "10.43.0.0/16"
 
 tags = {
   Team = "platform-engineering"

@@ -9,16 +9,16 @@ locals {
   #    Standard default is 10.42.0.0/16. Honoring your request.
   rke2_server_config = yamlencode({
     # Kubernetes networking
-    cluster-cidr       = var.pod_cidr
-    service-cidr       = var.service_cidr
+    cluster-cidr = var.pod_cidr
+    service-cidr = var.service_cidr
 
     # CoreDNS is the default in RKE2 — explicitly set for clarity
     cluster-dns = cidrhost(var.service_cidr, 10)  # e.g. 10.96.0.10
 
-    # Node-level configuration
-    node-label = [
-      "node-role.kubernetes.io/control-plane=true"
-    ]
+    # NOTE: Do NOT set node-role.kubernetes.io/control-plane here.
+    # The kubelet in k8s 1.26 rejects self-applied kubernetes.io labels
+    # that are not in the allowed prefix set. RKE2 handles control-plane
+    # node role labeling automatically via the node lifecycle controller.
 
     # Disable default nginx ingress on control plane
     # (nginx will run on workers only)
@@ -34,11 +34,13 @@ locals {
   })
 
   # RKE2 agent (worker) configuration
-  rke2_agent_config = yamlencode({
-    node-label = [
-      "node-role.kubernetes.io/worker=true"
-    ]
-  })
+  # NOTE: Do NOT set node-role.kubernetes.io/worker here — same restriction
+  # as the control-plane label. RKE2 worker role is handled automatically.
+  # Use empty string instead of yamlencode({}) — the rancherfederal module
+  # prepends this to the agent config file and {} causes YAML parse failures
+  # that silently drop the token and server fields that follow.
+  rke2_agent_config = ""
+
 
   tags = merge(var.tags, {
     Project     = var.cluster_name
@@ -52,14 +54,15 @@ locals {
 module "bastion" {
   source = "./modules/bastion"
 
-  name              = var.cluster_name
-  vpc_id            = aws_vpc.main.id
-  subnet_id         = aws_subnet.bastion.id
-  security_group_id = aws_security_group.bastion.id
-  ami_id            = var.ami_id
-  instance_type     = var.bastion_instance_type
-  key_name          = aws_key_pair.rke2.key_name
-  tags              = local.tags
+  name                 = var.cluster_name
+  vpc_id               = aws_vpc.main.id
+  subnet_id            = aws_subnet.bastion.id
+  security_group_id    = aws_security_group.bastion.id
+  ami_id               = var.ami_id
+  instance_type        = var.bastion_instance_type
+  key_name             = aws_key_pair.rke2.key_name
+  iam_instance_profile = aws_iam_instance_profile.bastion.name
+  tags                 = local.tags
 }
 
 # ============================================================
@@ -108,12 +111,24 @@ module "rke2" {
   # SSH hardening userdata (pre-RKE2)
   pre_userdata = <<-EOF
     #!/bin/bash
-    set -euo pipefail
+    # Intentionally no set -euo pipefail — SSH hardening must complete even
+    # if a later step fails.
 
     # Disable password auth and root login
     sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+
+    # KbdInteractiveAuthentication replaces ChallengeResponseAuthentication
+    # in OpenSSH 8.7+ (Ubuntu 24.04 ships 9.6). Set both for compatibility.
     sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
+    grep -qxF 'KbdInteractiveAuthentication no' /etc/ssh/sshd_config \
+      || echo 'KbdInteractiveAuthentication no' >> /etc/ssh/sshd_config
+
+    # IMPORTANT: Keep UsePAM yes on Ubuntu 24.04 — setting it to no breaks
+    # pubkey authentication because Ubuntu's sshd relies on PAM for session
+    # setup and account validation even for key-based logins.
+    sed -i 's/^#*UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+
     systemctl restart ssh || systemctl restart sshd
 
     # Kernel modules and sysctl for RKE2
@@ -194,12 +209,24 @@ module "rke2_workers" {
   # SSH hardening userdata (pre-RKE2)
   pre_userdata = <<-EOF
     #!/bin/bash
-    set -euo pipefail
+    # Intentionally no set -euo pipefail — SSH hardening must complete even
+    # if a later step fails.
 
     # Disable password auth and root login
     sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+
+    # KbdInteractiveAuthentication replaces ChallengeResponseAuthentication
+    # in OpenSSH 8.7+ (Ubuntu 24.04 ships 9.6). Set both for compatibility.
     sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
+    grep -qxF 'KbdInteractiveAuthentication no' /etc/ssh/sshd_config \
+      || echo 'KbdInteractiveAuthentication no' >> /etc/ssh/sshd_config
+
+    # IMPORTANT: Keep UsePAM yes on Ubuntu 24.04 — setting it to no breaks
+    # pubkey authentication because Ubuntu's sshd relies on PAM for session
+    # setup and account validation even for key-based logins.
+    sed -i 's/^#*UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+
     systemctl restart ssh || systemctl restart sshd
 
     # Kernel modules and sysctl for RKE2

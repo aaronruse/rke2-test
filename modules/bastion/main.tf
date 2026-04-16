@@ -4,58 +4,6 @@
 # SSH jump host with key-only auth, password auth disabled.
 # ============================================================
 
-variable "name" {
-  description = "Name prefix"
-  type        = string
-}
-
-variable "vpc_id" {
-  description = "VPC ID"
-  type        = string
-}
-
-variable "subnet_id" {
-  description = "Subnet ID for the bastion (must be a public subnet)"
-  type        = string
-}
-
-variable "security_group_id" {
-  description = "Security group ID for the bastion"
-  type        = string
-}
-
-variable "ami_id" {
-  description = "AMI ID for the bastion host"
-  type        = string
-}
-
-variable "instance_type" {
-  description = "EC2 instance type"
-  type        = string
-  default     = "t3.small"
-}
-
-variable "key_name" {
-  description = "AWS key pair name"
-  type        = string
-}
-
-variable "iam_instance_profile" {
-  description = "IAM instance profile name to attach to the bastion (for S3 kubeconfig access)"
-  type        = string
-  default     = ""
-}
-
-variable "tags" {
-  description = "Tags to apply"
-  type        = map(string)
-  default     = {}
-}
-
-# ============================================================
-# Userdata: harden SSH on first boot
-# Disables password auth, root login, enforces key-only.
-# ============================================================
 data "cloudinit_config" "bastion" {
   gzip          = false
   base64_encode = false
@@ -112,13 +60,36 @@ data "cloudinit_config" "bastion" {
         echo "awscli v2 installed."
       fi
 
-      # ---- Install kubectl matching RKE2 1.26 ----
-      KUBECTL_VERSION="v1.26.15"
+      # ---- Install kubectl matching the deployed RKE2 Kubernetes version ----
+      # kubectl_version is derived from rke2_version in the env layer and passed
+      # into this module, so it always stays in sync with the cluster.
+      KUBECTL_VERSION="${var.kubectl_version}"
       curl -sSL "https://dl.k8s.io/release/$${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
         -o /usr/local/bin/kubectl \
         && chmod +x /usr/local/bin/kubectl \
         && echo "kubectl $${KUBECTL_VERSION} installed." \
         || echo "WARNING: kubectl install failed"
+
+      # ---- Install uv and Ansible (via uv tool) ----
+      # uv is installed as the ubuntu user so tools land in ~/.local/bin
+      # and are available on the PATH for interactive SSH sessions.
+      if ! sudo -u ubuntu bash -c 'command -v uv &>/dev/null'; then
+        sudo -u ubuntu bash -c '
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+        ' && echo "uv installed." || echo "WARNING: uv install failed"
+      fi
+
+      # Install Ansible with kubernetes + openshift extras via uv tool.
+      # --with-executables-from ansible-core ensures ansible, ansible-playbook, etc.
+      # are placed on the PATH as top-level executables.
+      sudo -u ubuntu bash -c '
+        export PATH="$HOME/.local/bin:$PATH"
+        uv tool install \
+          --with-executables-from ansible-core \
+          --with kubernetes \
+          --with openshift \
+          ansible
+      ' && echo "Ansible installed via uv." || echo "WARNING: Ansible install via uv failed"
 
       echo "Bastion bootstrap complete."
     EOF
@@ -153,14 +124,4 @@ resource "aws_instance" "bastion" {
     Name = "${var.name}-bastion"
     Role = "bastion"
   })
-}
-
-output "instance_id" {
-  description = "EC2 instance ID of the bastion"
-  value       = aws_instance.bastion.id
-}
-
-output "private_ip" {
-  description = "Private IP of the bastion (not publicly routable)"
-  value       = aws_instance.bastion.private_ip
 }

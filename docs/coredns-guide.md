@@ -1,5 +1,3 @@
-# This guide is complete untested. once we test it we should remove this title
-
 # CoreDNS Setup & Public Ingress/Egress Guide
 
 This document explains the DNS architecture for your RKE2 cluster and provides

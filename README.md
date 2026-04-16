@@ -37,17 +37,17 @@ built on top of [rancherfederal/rke2-aws-tf](https://github.com/rancherfederal/r
 
 ### Key Parameters
 
-| Parameter         | Value                     |
-|-------------------|---------------------------|
-| VPC CIDR          | `10.0.0.0/16`             |
-| Pod CIDR          | `169.254.0.0/16`          |
-| Service CIDR      | `10.96.0.0/12`            |
-| CoreDNS IP        | `10.96.0.10`              |
-| Control Plane     | c5.2xlarge, 200 GB gp3    |
-| Workers           | t3.xlarge × 4, 350 GB gp3 |
-| RKE2 Version      | v1.26.15+rke2r1           |
-| OS                | CIS Ubuntu Linux 24.04 Benchmark - Level 1 - v03 -prod-2o2sghfkrk7vk |
-| AMI ID            |  ami-004ca9c8986f68ab5    | 
+| Parameter         | Value                                                                   |
+|-------------------|-------------------------------------------------------------------------|
+| VPC CIDR          | `10.0.0.0/16`                                                           |
+| Pod CIDR          | `169.254.0.0/16`                                                        |
+| Service CIDR      | `10.96.0.0/12`                                                          |
+| CoreDNS IP        | `10.96.0.10`                                                            |
+| Control Plane     | c5.2xlarge, 200 GB gp3                                                  |
+| Workers           | t3.xlarge × 4, 350 GB gp3                                              |
+| RKE2 Version      | v1.26.15+rke2r1                                                         |
+| OS                | CIS Ubuntu Linux 24.04 Benchmark - Level 1 - v03 -prod-2o2sghfkrk7vk  |
+| AMI ID            | ami-004ca9c8986f68ab5                                                   |
 
 ---
 
@@ -72,7 +72,7 @@ git clone git@gitlab.com:darksignal/devops/infra/rke2-aws-tf-toolshed.git
 
 1. **Run `scripts/bootstrap-rhel8.sh` first** — installs all tools and generates your SSH key
 2. **Subscribe to the CIS Ubuntu 24.04 AMI** on AWS Marketplace before deploying — see [docs/deployment-guide.md](docs/deployment-guide.md)
-3. **Restrict bastion SSH source** in `security_groups.tf` from `0.0.0.0/0` to your workspace's IP
+3. **Restrict bastion SSH source** in `modules/securitygroups/main.tf` from `0.0.0.0/0` to your workspace's IP
 4. **Single control plane is a SPOF** — set `control_plane_count = 3` for production HA
 5. **RKE2 v1.26 is EOL** — plan upgrade to v1.28+ after initial deployment
 
@@ -109,13 +109,14 @@ aws ec2 describe-images \
   --output table --region us-east-1
 
 # 6. Edit terraform.tfvars — set ami_id, cluster_name, region
-vi terraform.tfvars
+vi environments/prod/terraform.tfvars
 
-# 7. Restrict bastion SSH source to your workspace IP in security_groups.tf
+# 7. Restrict bastion SSH source to your workspace IP in modules/securitygroups/main.tf
 curl -s https://api.ipify.org   # find your IP
-vi security_groups.tf
+vi modules/securitygroups/main.tf
 
 # 8. Deploy everything in one shot (~10-15 min)
+cd environments/prod
 terraform init
 terraform plan -out=tfplan
 terraform apply tfplan
@@ -137,33 +138,41 @@ runbook and [docs/coredns-guide.md](docs/coredns-guide.md) for DNS and ingress s
 
 ## File Structure
 
-
-
 ```
 rke2-aws-infra/
-├── versions.tf           # Provider and Terraform version constraints
-├── variables.tf          # All input variables with descriptions
-├── terraform.tfvars      # Your environment values (gitignored in prod)
-├── networking.tf         # VPC, subnets, IGW, NAT, route tables, EIPs
-├── security_groups.tf    # SGs for bastion, control plane, workers
-├── ssh_keys.tf           # AWS key pair from local public key file
-├── data.tf               # Data sources
-├── main.tf               # rke2 + agent modules, app NLB wiring
-├── outputs.tf            # Key outputs (IPs, DNS, S3 paths, SSH instructions)
-├── scripts/
-│   └── bootstrap-rhel8.sh     # Auto-installs all tools on RHEL 8; run first
+├── environments/
+│   └── prod/
+│       ├── main.tf               # Provider, data sources, locals, all module calls, outputs
+│       ├── variables.tf          # All input variables with descriptions
+│       ├── terraform.tfvars      # Your environment values (gitignored in prod)
+│       ├── iam.tf                # Bastion IAM role, policy, and instance profile
+│       └── ssh_keys.tf           # AWS key pair from local public key file
 ├── modules/
-│   └── bastion/
-│       └── main.tf       # Bastion EC2 instance with SSH hardening
+│   ├── networking/
+│   │   ├── main.tf               # VPC, subnets, IGW, NAT gateway, route tables, EIPs
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   ├── securitygroups/
+│   │   ├── main.tf               # SGs for bastion, control plane, and workers
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   ├── bastion/
+│   │   └── main.tf               # Bastion EC2 instance with cloud-init SSH hardening
+│   └── rke2/
+│       ├── main.tf               # RKE2 control plane + worker nodepool, app NLB wiring
+│       ├── variables.tf
+│       └── outputs.tf
+├── scripts/
+│   └── bootstrap-rhel8.sh        # Auto-installs all tools on RHEL 8; run first
 ├── helm/
-│   ├── deploy.sh              # Idempotent Helm deployment script
+│   ├── deploy.sh                 # Idempotent Helm deployment script
 │   ├── ingress-nginx-values.yaml
 │   ├── cert-manager-values.yaml
 │   ├── coredns-values.yaml
 │   └── coredns-helmchart-patch.yaml
 └── docs/
-    ├── deployment-guide.md    # Full step-by-step operator runbook (RHEL 8)
-    └── coredns-guide.md       # CoreDNS setup + public ingress/egress guide
+    ├── deployment-guide.md       # Full step-by-step operator runbook (RHEL 8)
+    └── coredns-guide.md          # CoreDNS setup + public ingress/egress guide
 ```
 
 ---

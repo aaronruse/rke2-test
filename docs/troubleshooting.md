@@ -1,5 +1,3 @@
-# A long list of helpful hints we should continue to add to for dealing with this deployment 
-
 Make sure your ssh client is clean:
 ```
 eval $(ssh-agent -s)
@@ -10,6 +8,10 @@ ssh-add -l
 ssh -i ~/.ssh/rke2_id_ed25519 ubuntu@$(terraform output -raw bastion_public_ip)
 ```
 
+How to SSH forward from the aws workspace to the bastion a cp node
+```
+ssh -A -J ubuntu@<bastion-public-ip> ubuntu@<target-private-ip>
+```
 
 ```bash
 aws ec2 describe-key-pairs \
@@ -144,11 +146,42 @@ connect to cp
 ssh ubuntu@cp_ip1
 ```
 
-bash# Is rke2-server running?
+sudo cloud-init status
+sudo tail -f /var/log/cloud-init-output.log
+
+# 1. Overall RKE2 service state and how long it's been running
 sudo systemctl status rke2-server
 
-# Last 50 lines of logs
+# 2. Live log — run this and wait 30 seconds to see if anything is progressing
 sudo journalctl -u rke2-server -n 50 --no-pager
+
+# 3. Are any containers running at all yet?
+sudo /var/lib/rancher/rke2/bin/crictl \
+  --runtime-endpoint unix:///run/k3s/containerd/containerd.sock \
+  ps -a
+
+# 4. Confirm the cgroup fix actually took effect this boot
+grep "unified_cgroup_hierarchy" /proc/cmdline
+
+# 5. Current disk and memory
+df -h /var/lib/rancher
+free -m
+
+# 1. List all cloud-init scripts that were supposed to run
+sudo ls -la /var/lib/cloud/instance/scripts/
+
+# 2. Check all cloud-init logs, not just output — this shows which scripts ran
+sudo cat /var/log/cloud-init.log | grep -E "script|rke2|error|warn|fail" | tail -50
+
+# 3. Check if there are multiple user-data parts (rke2-aws-tf injects its own)
+sudo cat /var/lib/cloud/instance/user-data.txt 2>/dev/null | head -20
+sudo ls /var/lib/cloud/instance/
+
+# 4. Check if the rke2 install script exists and what's in it
+sudo find /var/lib/cloud -name "*.sh" -o -name "rke2*" 2>/dev/null
+
+# 5. Check if there was a reboot loop — how many times has cloud-init run?
+sudo journalctl -u cloud-init --no-pager | grep "running\|finished" | tail -20
 
 # Are nodes registered?
 sudo /var/lib/rancher/rke2/bin/kubectl \

@@ -146,7 +146,7 @@ resource "aws_route_table_association" "workers_private" {
 # ============================================================
 resource "aws_eip" "bastion" {
   domain   = "vpc"
-  instance = module.bastion.instance_id
+  instance = var.bastion_instance_id
 
   tags = merge(var.tags, {
     Name = "${var.cluster_name}-eip-bastion"

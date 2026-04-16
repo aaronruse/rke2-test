@@ -18,6 +18,7 @@ data "local_file" "ssh_public_key" {
 # Hash the public key content so Terraform detects any change to it
 locals {
   ssh_public_key_hash = sha256(trimspace(data.local_file.ssh_public_key.content))
+  ssh_public_key      = trimspace(data.local_file.ssh_public_key.content)
 }
 
 resource "aws_key_pair" "rke2" {
@@ -26,7 +27,7 @@ resource "aws_key_pair" "rke2" {
   key_name_prefix = "${var.cluster_name}-keypair-"
   public_key      = trimspace(data.local_file.ssh_public_key.content)
 
-  tags = merge(var.tags, {
+  tags = merge(local.tags, {
     Name    = "${var.cluster_name}-keypair"
     # Embedding the key hash as a tag forces Terraform to detect key rotation
     # and replace this resource automatically on the next apply.

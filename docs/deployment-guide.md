@@ -183,10 +183,8 @@ Note the `ImageId` (format: `ami-XXXXXXXXXXXXXXXXX`).
 
 ## Step 7 — Configure terraform.tfvars
 
-Open `terraform.tfvars` with your preferred editor (`vi`, `nano`, `vim`):
-
 ```bash
-vi terraform.tfvars
+vi environments/prod/terraform.tfvars
 ```
 
 Set the following values at minimum:
@@ -210,9 +208,9 @@ rke2_version = "v1.26.15+rke2r1"   # EOL — plan upgrade to v1.28+ after deploy
 
 ## Step 8 — Restrict the Bastion SSH Source CIDR
 
-Open `security_groups.tf` and replace `0.0.0.0/0` in the bastion ingress rule
-with the public IP of your RHEL 8 workspace. This locks SSH access to the
-bastion down to your workspace only:
+Open `modules/securitygroups/main.tf` and replace `0.0.0.0/0` in the bastion
+ingress rule with the public IP of your RHEL 8 workspace. This locks SSH access
+to the bastion down to your workspace only:
 
 ```bash
 # Find your workspace's public egress IP
@@ -220,10 +218,10 @@ curl -s https://api.ipify.org
 # e.g. 203.0.113.42
 ```
 
-Then edit `security_groups.tf`:
+Then edit the file:
 
 ```bash
-vi security_groups.tf
+vi modules/securitygroups/main.tf
 ```
 
 Find and update this block:
@@ -247,6 +245,7 @@ ingress {
 ## Step 9 — Initialise Terraform
 
 ```bash
+cd environments/prod
 terraform init
 ```
 
@@ -401,6 +400,9 @@ cd ~/rke2-aws-infra
 # Pull latest from GitLab
 git pull origin main
 
+# Navigate to the prod environment
+cd environments/prod
+
 # Review changes
 terraform plan -out=tfplan
 
@@ -453,7 +455,7 @@ Then reload: `source ~/.bashrc`
 | Nodes stuck in `NotReady` after 15 min | Canal/VXLAN blocked or RKE2 bootstrap failed | SSH to control plane via bastion; check `sudo journalctl -u rke2-server -f` |
 | Worker nodes not joining | S3 token fetch failed or IAM policy missing | Check worker userdata logs: `sudo cat /var/log/cloud-init-output.log` |
 | `kubectl` connection refused | kubeconfig server URL mismatch | Confirm `~/.kube/config` server points to the internal NLB DNS, not localhost |
-| SSH to bastion fails | Bastion SG source CIDR doesn't match workspace IP | Update `security_groups.tf` CIDR and run `terraform apply` |
+| SSH to bastion fails | Bastion SG source CIDR doesn't match workspace IP | Update `modules/securitygroups/main.tf` CIDR and run `terraform apply` |
 | Spot worker interrupted, pod lost | Expected spot behaviour | Ensure app `replicas >= 2` and PodDisruptionBudget is set |
 
 ---
@@ -474,10 +476,11 @@ Then reload: `source ~/.bashrc`
 ## Upgrade Path (RKE2 1.26 → 1.28)
 
 ```bash
-# 1. Update rke2_version in terraform.tfvars:
+# 1. Update rke2_version in environments/prod/terraform.tfvars:
 #      rke2_version = "v1.28.15+rke2r1"
 
 # 2. Plan and review launch template changes
+cd environments/prod
 terraform plan -out=tfplan
 
 # 3. Apply
@@ -497,5 +500,6 @@ helm uninstall ingress-nginx -n ingress-nginx
 helm uninstall cert-manager -n cert-manager
 
 # Destroy all Terraform-managed infrastructure
+cd environments/prod
 terraform destroy
 ```

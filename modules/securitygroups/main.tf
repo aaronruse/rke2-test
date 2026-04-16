@@ -6,7 +6,7 @@
 resource "aws_security_group" "bastion" {
   name        = "${var.cluster_name}-sg-bastion"
   description = "Bastion host: allow SSH inbound from allowed CIDRs only"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = var.vpc_id
 
   # SSH from internet — RESTRICT THIS to your org's IP range in production.
   # Replace 0.0.0.0/0 with your egress NAT IP or VPN CIDR.
@@ -37,7 +37,7 @@ resource "aws_security_group" "bastion" {
 resource "aws_security_group" "control_plane" {
   name        = "${var.cluster_name}-sg-control-plane"
   description = "RKE2 control plane nodes"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = var.vpc_id
 
   # SSH from bastion only
   ingress {
@@ -121,7 +121,7 @@ resource "aws_security_group" "control_plane" {
 resource "aws_security_group" "workers" {
   name        = "${var.cluster_name}-sg-workers"
   description = "RKE2 worker nodes"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = var.vpc_id
 
   # SSH from bastion only
   ingress {

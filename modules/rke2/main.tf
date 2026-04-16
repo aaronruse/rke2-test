@@ -1,9 +1,4 @@
-# ============================================================
-# SSH public key content (used by rke2-aws-tf modules)
-# ============================================================
 locals {
-  ssh_public_key = trimspace(data.local_file.ssh_public_key.content)
-
   # RKE2 server configuration
   # ⚠️  169.254.0.0/16 pod CIDR is non-standard (link-local range).
   #    Standard default is 10.42.0.0/16. Honoring your request.
@@ -41,75 +36,8 @@ locals {
   # that silently drop the token and server fields that follow.
   rke2_agent_config = ""
 
-
-  tags = merge(var.tags, {
-    Project     = var.cluster_name
-    Environment = var.environment
-  })
-}
-
-# ============================================================
-# Bastion Module (custom — in modules/bastion/)
-# ============================================================
-module "bastion" {
-  source = "./modules/bastion"
-
-  name                 = var.cluster_name
-  vpc_id               = aws_vpc.main.id
-  subnet_id            = aws_subnet.bastion.id
-  security_group_id    = aws_security_group.bastion.id
-  ami_id               = var.ami_id
-  instance_type        = var.bastion_instance_type
-  key_name             = aws_key_pair.rke2.key_name
-  iam_instance_profile = aws_iam_instance_profile.bastion.name
-  tags                 = local.tags
-}
-
-# ============================================================
-# RKE2 Server (Control Plane) — rancherfederal module
-# ============================================================
-module "rke2" {
-  source = "git::https://github.com/rancherfederal/rke2-aws-tf.git?ref=v2.5.1"
-
-  cluster_name = var.cluster_name
-  vpc_id       = aws_vpc.main.id
-  subnets      = [aws_subnet.control_plane.id]
-  ami          = var.ami_id
-
-  # Instance configuration
-  instance_type = var.control_plane_instance_type
-  servers       = var.control_plane_count
-
-  # Disk
-  block_device_mappings = {
-    size      = tostring(var.control_plane_disk_size_gb)
-    encrypted = "true"
-    type      = "gp3"
-  }
-
-  # SSH
-  ssh_authorized_keys = [local.ssh_public_key]
-
-  # Keep control plane internal (not publicly accessible) — best practice
-  controlplane_internal = true
-
-  # RKE2 version
-  rke2_version = var.rke2_version
-  rke2_channel = var.rke2_channel
-
-  # RKE2 cluster networking config
-  rke2_config = local.rke2_server_config
-
-  # IMDSv2 enforced
-  metadata_options = {
-    http_endpoint               = "enabled"
-    http_tokens                 = "required"
-    http_put_response_hop_limit = 3
-    instance_metadata_tags      = "disabled"
-  }
-
-  # SSH hardening userdata (pre-RKE2)
-  pre_userdata = <<-EOF
+  # SSH hardening userdata — shared between control plane and workers
+  ssh_hardening_userdata = <<-EOF
     #!/bin/bash
     # Intentionally no set -euo pipefail — SSH hardening must complete even
     # if a later step fails.
@@ -137,9 +65,56 @@ module "rke2" {
     printf 'net.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward = 1\n' > /etc/sysctl.d/99-kubernetes.conf
     sysctl -p /etc/sysctl.d/99-kubernetes.conf
   EOF
+}
+
+# ============================================================
+# RKE2 Server (Control Plane) — rancherfederal module
+# ============================================================
+module "rke2" {
+  source = "git::https://github.com/rancherfederal/rke2-aws-tf.git?ref=v2.5.1"
+
+  cluster_name = var.cluster_name
+  vpc_id       = var.vpc_id
+  subnets      = [var.control_plane_subnet_id]
+  ami          = var.ami_id
+
+  # Instance configuration
+  instance_type = var.control_plane_instance_type
+  servers       = var.control_plane_count
+
+  # Disk
+  block_device_mappings = {
+    size      = tostring(var.control_plane_disk_size_gb)
+    encrypted = "true"
+    type      = "gp3"
+  }
+
+  # SSH
+  ssh_authorized_keys = [var.ssh_public_key]
+
+  # Keep control plane internal (not publicly accessible) — best practice
+  controlplane_internal = true
+
+  # RKE2 version
+  rke2_version = var.rke2_version
+  rke2_channel = var.rke2_channel
+
+  # RKE2 cluster networking config
+  rke2_config = local.rke2_server_config
+
+  # IMDSv2 enforced
+  metadata_options = {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 3
+    instance_metadata_tags      = "disabled"
+  }
+
+  # SSH hardening userdata (pre-RKE2)
+  pre_userdata = local.ssh_hardening_userdata
 
   # Security group additions — allow workers and bastion to communicate with CP
-  extra_security_group_ids = [aws_security_group.control_plane.id]
+  extra_security_group_ids = [var.control_plane_sg_id]
 
   # ASG termination policy
   termination_policies = ["Default"]
@@ -147,7 +122,7 @@ module "rke2" {
   # Increase timeout for CIS hardened image bootstrap (default is 10m)
   wait_for_capacity_timeout = var.wait_for_capacity_timeout
 
-  tags = local.tags
+  tags = var.tags
 }
 
 # ============================================================
@@ -157,8 +132,8 @@ module "rke2_workers" {
   source = "git::https://github.com/rancherfederal/rke2-aws-tf.git//modules/agent-nodepool?ref=v2.5.1"
 
   name    = "workers"
-  vpc_id  = aws_vpc.main.id
-  subnets = [aws_subnet.workers.id]
+  vpc_id  = var.vpc_id
+  subnets = [var.worker_subnet_id]
   ami     = var.ami_id
 
   # Instance configuration
@@ -189,7 +164,7 @@ module "rke2_workers" {
   }
 
   # SSH
-  ssh_authorized_keys = [local.ssh_public_key]
+  ssh_authorized_keys = [var.ssh_public_key]
 
   # RKE2 version
   rke2_version = var.rke2_version
@@ -207,42 +182,15 @@ module "rke2_workers" {
   }
 
   # SSH hardening userdata (pre-RKE2)
-  pre_userdata = <<-EOF
-    #!/bin/bash
-    # Intentionally no set -euo pipefail — SSH hardening must complete even
-    # if a later step fails.
-
-    # Disable password auth and root login
-    sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-
-    # KbdInteractiveAuthentication replaces ChallengeResponseAuthentication
-    # in OpenSSH 8.7+ (Ubuntu 24.04 ships 9.6). Set both for compatibility.
-    sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
-    grep -qxF 'KbdInteractiveAuthentication no' /etc/ssh/sshd_config \
-      || echo 'KbdInteractiveAuthentication no' >> /etc/ssh/sshd_config
-
-    # IMPORTANT: Keep UsePAM yes on Ubuntu 24.04 — setting it to no breaks
-    # pubkey authentication because Ubuntu's sshd relies on PAM for session
-    # setup and account validation even for key-based logins.
-    sed -i 's/^#*UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
-
-    systemctl restart ssh || systemctl restart sshd
-
-    # Kernel modules and sysctl for RKE2
-    modprobe overlay || true
-    modprobe br_netfilter || true
-    printf 'net.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward = 1\n' > /etc/sysctl.d/99-kubernetes.conf
-    sysctl -p /etc/sysctl.d/99-kubernetes.conf
-  EOF
+  pre_userdata = local.ssh_hardening_userdata
 
   # Security group additions — attach worker SG
-  extra_security_group_ids = [aws_security_group.workers.id]
+  extra_security_group_ids = [var.workers_sg_id]
 
   # Join the cluster created by the rke2 module
   cluster_data = module.rke2.cluster_data
 
-  tags = local.tags
+  tags = var.tags
 }
 
 # ============================================================
@@ -257,14 +205,14 @@ resource "aws_lb" "app" {
 
   # Use the pre-allocated EIP for a stable public IP
   subnet_mapping {
-    subnet_id     = aws_subnet.bastion.id
-    allocation_id = aws_eip.worker_nlb.id
+    subnet_id     = var.bastion_subnet_id
+    allocation_id = var.worker_nlb_eip_id
   }
 
   enable_deletion_protection       = false
   enable_cross_zone_load_balancing = false
 
-  tags = merge(local.tags, {
+  tags = merge(var.tags, {
     Name = "${var.cluster_name}-app-nlb"
   })
 }
@@ -275,7 +223,7 @@ resource "aws_lb_target_group" "http" {
   port        = 80
   protocol    = "TCP"
   target_type = "instance"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = var.vpc_id
 
   health_check {
     protocol            = "TCP"
@@ -285,7 +233,7 @@ resource "aws_lb_target_group" "http" {
     interval            = 10
   }
 
-  tags = merge(local.tags, {
+  tags = merge(var.tags, {
     Name = "${var.cluster_name}-tg-http"
   })
 }
@@ -296,7 +244,7 @@ resource "aws_lb_target_group" "https" {
   port        = 443
   protocol    = "TCP"
   target_type = "instance"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = var.vpc_id
 
   health_check {
     protocol            = "TCP"
@@ -306,7 +254,7 @@ resource "aws_lb_target_group" "https" {
     interval            = 10
   }
 
-  tags = merge(local.tags, {
+  tags = merge(var.tags, {
     Name = "${var.cluster_name}-tg-https"
   })
 }

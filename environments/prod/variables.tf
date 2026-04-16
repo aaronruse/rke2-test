@@ -66,6 +66,13 @@ variable "rke2_version" {
   default     = "v1.26.15+rke2r1"
 }
 
+# Derive the kubectl version from rke2_version by stripping the '+rke2rN' suffix.
+# e.g. "v1.26.15+rke2r1" → "v1.26.15"
+# This local is consumed by the bastion module so kubectl always matches the cluster.
+locals {
+  kubectl_version = "v${split("+", trimprefix(var.rke2_version, "v"))[0]}"
+}
+
 variable "rke2_channel" {
   description = "RKE2 channel to use (overridden by rke2_version when version is pinned)"
   type        = string
@@ -174,8 +181,8 @@ variable "wait_for_capacity_timeout" {
     as healthy with the NLB before timing out. CIS hardened images take longer
     to bootstrap than standard images — 20m is recommended over the default 10m.
   DESC
-  type    = string
-  default = "20m"
+  type        = string
+  default     = "20m"
 }
 
 # ============================================================

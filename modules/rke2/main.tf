@@ -1,7 +1,5 @@
 locals {
   # RKE2 server configuration
-  # ⚠️  169.254.0.0/16 pod CIDR is non-standard (link-local range).
-  #    Standard default is 10.42.0.0/16. Honoring your request.
   rke2_server_config = yamlencode({
     # Kubernetes networking
     cluster-cidr = var.pod_cidr

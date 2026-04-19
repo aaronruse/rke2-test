@@ -40,7 +40,7 @@ built on top of [rancherfederal/rke2-aws-tf](https://github.com/rancherfederal/r
 | Parameter         | Value                                                                   |
 |-------------------|-------------------------------------------------------------------------|
 | VPC CIDR          | `10.0.0.0/16`                                                           |
-| Pod CIDR          | `169.254.0.0/16`                                                        |
+| Pod CIDR          | `10.42.0.0/16`                                                        |
 | Service CIDR      | `10.96.0.0/12`                                                          |
 | CoreDNS IP        | `10.96.0.10`                                                            |
 | Control Plane     | c5.2xlarge, 200 GB gp3                                                  |

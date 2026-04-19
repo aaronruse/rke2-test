@@ -188,13 +188,10 @@ variable "wait_for_capacity_timeout" {
 # ============================================================
 # Kubernetes Networking
 # ============================================================
-# NOTE: 169.254.0.0/16 is the link-local range. RKE2/Canal can use it
-# for the pod overlay CIDR, but this is non-standard. The conventional
-# default is 10.42.0.0/16. Honoring your request but documenting the deviation.
 variable "pod_cidr" {
   description = "CIDR block for Kubernetes pods (overlay network)"
   type        = string
-  default     = "169.254.0.0/16"
+  default     = "10.42.0.0/16"
 }
 
 variable "service_cidr" {

@@ -466,7 +466,6 @@ Then reload: `source ~/.bashrc`
 |------|-------------|-------------------|-------|
 | Control plane count | 1 | 3 (etcd HA quorum) | Single CP is a SPOF. Set `control_plane_count = 3` for production. |
 | RKE2 version | v1.26.15 | v1.28+ or v1.29+ | v1.26 is EOL. Plan upgrade. |
-| Pod CIDR | 169.254.0.0/16 | 10.42.0.0/16 | Link-local range; monitor DNS reverse-lookup behaviour. |
 | Ubuntu version | 24.04 + RKE2 1.26 | Ubuntu 22.04 + RKE2 1.26 | Kernel 6.8 is newer than RKE2 1.26 test matrix; validate carefully. |
 | Bastion SSH CIDR | Workspace IP/32 | Org egress CIDR | Confirm locked down before deploying. |
 | Worker instances | Spot | On-Demand | Set `worker_spot = false` in tfvars to revert if workloads need guaranteed capacity. |

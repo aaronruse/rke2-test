@@ -311,13 +311,6 @@ kubectl logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx --tail=50
 | CoreDNS IP     | `10.96.0.10`     | 10th address in service CIDR       |
 | Kubernetes SVC | `10.96.0.1`      | 1st address — kubernetes API svc   |
 
-### Pod CIDR Note
-
-Your pod CIDR is `169.254.0.0/16` (link-local). CoreDNS reverse DNS lookups
-for pod IPs (`ip6.arpa` / `in-addr.arpa`) may behave unexpectedly with this
-range on some OS network stacks since 169.254.x.x is typically reserved.
-Standard alternative: `10.42.0.0/16`. Monitor for any DNS reverse-lookup issues.
-
 ### Useful CoreDNS Diagnostic Commands
 
 ```bash

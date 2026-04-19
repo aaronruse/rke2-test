@@ -11,7 +11,7 @@ vpc_cidr                  = "10.0.0.0/16"
 bastion_subnet_cidr       = "10.0.0.0/24"
 control_plane_subnet_cidr = "10.0.1.0/24"
 worker_subnet_cidr        = "10.0.2.0/24"
-availability_zone         = "us-west-2c"
+availability_zone         = "us-west-2a"
 
 # ------- RKE2 -------
 # CIS hardened images take longer to bootstrap than standard images.
@@ -29,7 +29,6 @@ worker_spot         = true
 
 # ------- Compute -------
 control_plane_instance_type = "t3.xlarge"
-# customer uses r5.2xlarge
 worker_instance_type        = "t3.2xlarge"
 bastion_instance_type       = "t3.small"
 control_plane_disk_size_gb  = 200

@@ -3,10 +3,10 @@
 # Grants the bastion all permissions needed to manage an RKE2
 # cluster — EC2, ASG, S3, ELB, SSM, EKS read, CloudWatch logs.
 # ============================================================
-
 data "aws_iam_policy_document" "bastion_assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
+
     principals {
       type        = "Service"
       identifiers = ["ec2.amazonaws.com"]
@@ -17,12 +17,10 @@ data "aws_iam_policy_document" "bastion_assume_role" {
 resource "aws_iam_role" "bastion" {
   name               = "${var.cluster_name}-bastion-role"
   assume_role_policy = data.aws_iam_policy_document.bastion_assume_role.json
-
-  tags = local.tags
+  tags               = local.tags
 }
 
 data "aws_iam_policy_document" "bastion" {
-
   # ---- S3: kubeconfig + RKE2 bootstrap artifacts ----
   statement {
     sid    = "S3RKE2Artifacts"
@@ -38,6 +36,38 @@ data "aws_iam_policy_document" "bastion" {
     resources = [
       "arn:aws:s3:::${var.cluster_name}*",
       "arn:aws:s3:::${var.cluster_name}*/*",
+    ]
+  }
+
+  # ---- S3: Terraform state bucket read access ----
+  # Allows the bastion to read state, SSH key, and outputs
+  # snapshot from the tfstate bucket for operational use.
+  statement {
+    sid    = "S3TFStateRead"
+    effect = "Allow"
+    actions = [
+      "s3:GetObject",
+      "s3:ListBucket",
+      "s3:GetBucketLocation",
+    ]
+    resources = [
+      aws_s3_bucket.tfstate.arn,
+      "${aws_s3_bucket.tfstate.arn}/*",
+    ]
+  }
+
+  # ---- DynamoDB: Terraform state lock table read access ----
+  # Allows the bastion to inspect lock state for debugging
+  # stuck or abandoned Terraform locks.
+  statement {
+    sid    = "DynamoDBTFStateLockRead"
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:DescribeTable",
+    ]
+    resources = [
+      aws_dynamodb_table.tfstate_lock.arn,
     ]
   }
 
@@ -218,6 +248,125 @@ resource "aws_iam_role_policy_attachment" "bastion_ssm" {
 resource "aws_iam_instance_profile" "bastion" {
   name = "${var.cluster_name}-bastion-profile"
   role = aws_iam_role.bastion.name
-
   tags = local.tags
+}
+
+# ============================================================
+# KMS: EBS Volume Encryption Key
+# A customer-managed KMS key is used for all cluster EBS
+# volumes so that key policy, rotation, and ARN are fully
+# visible and auditable in Terraform state.
+#
+# The key policy has four statements:
+#   1. Root account — prevents lock-out, allows IAM delegation
+#   2. AutoScaling encryption — lets the service-linked role
+#      create and attach encrypted volumes when launching ASG
+#      instances. Without this the instances fail to start.
+#   3. AutoScaling CreateGrant — allows the service to grant
+#      volume access to instances (restricted to AWS resources).
+#   4. Key administrator — the IAM identity running Terraform
+#      can manage the key lifecycle.
+# ============================================================
+data "aws_iam_policy_document" "ebs_kms" {
+  # Statement 1 — root account ownership / IAM delegation
+  statement {
+    sid    = "EnableRootAccountAccess"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  # Statement 2 — AutoScaling service-linked role encryption permissions
+  statement {
+    sid    = "AllowAutoScalingEncryption"
+    effect = "Allow"
+
+    principals {
+      type = "AWS"
+      identifiers = [
+        "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
+      ]
+    }
+
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey",
+    ]
+    resources = ["*"]
+  }
+
+  # Statement 3 — AutoScaling CreateGrant (required separately)
+  # Restricted to AWS service use only via GrantIsForAWSResource.
+  statement {
+    sid    = "AllowAutoScalingCreateGrant"
+    effect = "Allow"
+
+    principals {
+      type = "AWS"
+      identifiers = [
+        "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
+      ]
+    }
+
+    actions   = ["kms:CreateGrant"]
+    resources = ["*"]
+
+    condition {
+      test     = "Bool"
+      variable = "kms:GrantIsForAWSResource"
+      values   = ["true"]
+    }
+  }
+
+  # Statement 4 — key administrator (IAM identity running Terraform)
+  statement {
+    sid    = "AllowKeyAdministration"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = [data.aws_caller_identity.current.arn]
+    }
+
+    actions = [
+      "kms:Create*",
+      "kms:Describe*",
+      "kms:Enable*",
+      "kms:List*",
+      "kms:Put*",
+      "kms:Update*",
+      "kms:Revoke*",
+      "kms:Disable*",
+      "kms:Get*",
+      "kms:Delete*",
+      "kms:ScheduleKeyDeletion",
+      "kms:CancelKeyDeletion",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_kms_key" "ebs" {
+  description             = "KMS key for RKE2 cluster EBS volume encryption (${var.cluster_name})"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+  policy                  = data.aws_iam_policy_document.ebs_kms.json
+
+  tags = merge(local.tags, {
+    Name = "${var.cluster_name}-ebs-kms-key"
+  })
+}
+
+resource "aws_kms_alias" "ebs" {
+  name          = "alias/${var.cluster_name}-ebs"
+  target_key_id = aws_kms_key.ebs.key_id
 }

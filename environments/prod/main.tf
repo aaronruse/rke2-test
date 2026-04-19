@@ -1,6 +1,30 @@
 terraform {
   required_version = ">= 1.3"
 
+  # ============================================================
+  # Remote Backend — S3 + DynamoDB state locking
+  #
+  # IMPORTANT: The bucket and DynamoDB table must exist before
+  # running `terraform init` with this backend. Bootstrap them
+  # first by temporarily commenting out this block, running:
+  #   terraform init && terraform apply -target=aws_s3_bucket.tfstate \
+  #     -target=aws_dynamodb_table.tfstate_lock
+  # Then uncomment this block and run `terraform init` again to
+  # migrate local state into the bucket.
+  #
+  # Values here cannot use variables — they must be hardcoded.
+  # ============================================================
+  backend "s3" {
+    bucket         = "rke2-prod-tfstate-641275310402"
+    key            = "state/terraform.tfstate"
+    region         = "us-west-2"
+    dynamodb_table = "rke2-prod-tfstate-lock"
+    encrypt        = true
+    # kms_key_id is optional here — the bucket's default KMS key
+    # (set in aws_s3_bucket_server_side_encryption_configuration)
+    # will be used automatically for state file encryption.
+  }
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -206,22 +230,39 @@ output "nat_gateway_public_ip" {
   value       = module.networking.nat_gateway_public_ip
 }
 
-# ============================================================
-# KMS Key Outputs
-# ============================================================
 output "ebs_kms_key_arn" {
   description = "ARN of the KMS key used to encrypt all cluster EBS volumes"
-  value       = module.rke2.ebs_kms_key_arn
+  value       = aws_kms_key.ebs.arn
 }
 
 output "ebs_kms_key_id" {
   description = "ID of the KMS key used to encrypt all cluster EBS volumes"
-  value       = module.rke2.ebs_kms_key_id
+  value       = aws_kms_key.ebs.key_id
 }
 
 output "ebs_kms_key_alias" {
   description = "Alias of the KMS key used to encrypt all cluster EBS volumes"
-  value       = module.rke2.ebs_kms_key_alias
+  value       = aws_kms_alias.ebs.name
+}
+
+output "tfstate_bucket" {
+  description = "S3 bucket holding Terraform state, SSH public key, and outputs snapshot"
+  value       = aws_s3_bucket.tfstate.bucket
+}
+
+output "tfstate_dynamodb_table" {
+  description = "DynamoDB table used for Terraform state locking"
+  value       = aws_dynamodb_table.tfstate_lock.name
+}
+
+output "ssh_public_key_s3_path" {
+  description = "S3 path of the uploaded SSH public key"
+  value       = "s3://${aws_s3_bucket.tfstate.bucket}/${aws_s3_object.ssh_public_key.key}"
+}
+
+output "tf_outputs_s3_path" {
+  description = "S3 path of the Terraform outputs JSON snapshot"
+  value       = "s3://${aws_s3_bucket.tfstate.bucket}/${aws_s3_object.tf_outputs.key}"
 }
 
 output "ssh_connect_instructions" {

@@ -66,15 +66,127 @@ locals {
 }
 
 # ============================================================
+# Data sources needed for KMS key policy
+# ============================================================
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+# ============================================================
+# KMS Key Policy
+# EC2 and the Auto Scaling service need explicit permission to
+# use a customer-managed KMS key for EBS encryption. Without
+# this policy the instances fail to launch because the service
+# cannot encrypt/decrypt the root volume, causing the ASG to
+# report 0 healthy instances and Terraform to time out.
+#
+# Three statements are required:
+#   1. Root account full access — allows IAM policies to delegate
+#      key access and prevents permanent lock-out.
+#   2. EC2 autoscaling service — allows the service-linked role
+#      used by Auto Scaling to create encrypted volumes when
+#      launching instances from a launch template.
+#   3. Key administrators — allows Terraform's caller identity
+#      (the IAM user/role running the apply) to manage the key.
+# ============================================================
+data "aws_iam_policy_document" "ebs_kms" {
+  # Statement 1 — root account ownership / IAM delegation
+  statement {
+    sid    = "EnableRootAccountAccess"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  # Statement 2 — Auto Scaling service-linked role encryption permissions
+  # The Auto Scaling service-linked role needs these actions to create
+  # encrypted EBS volumes when launching instances from a launch template.
+  statement {
+    sid    = "AllowAutoScalingEncryption"
+    effect = "Allow"
+
+    principals {
+      type = "AWS"
+      identifiers = [
+        "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
+      ]
+    }
+
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey",
+    ]
+    resources = ["*"]
+  }
+
+  # Statement 3 — CreateGrant for Auto Scaling (required separately)
+  # Allows Auto Scaling to grant the EBS volume access to the instance.
+  # The GrantIsForAWSResource condition restricts this to AWS service use only.
+  statement {
+    sid    = "AllowAutoScalingCreateGrant"
+    effect = "Allow"
+
+    principals {
+      type = "AWS"
+      identifiers = [
+        "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
+      ]
+    }
+
+    actions   = ["kms:CreateGrant"]
+    resources = ["*"]
+
+    condition {
+      test     = "Bool"
+      variable = "kms:GrantIsForAWSResource"
+      values   = ["true"]
+    }
+  }
+
+  # Statement 4 — key administrator (the IAM identity running Terraform)
+  statement {
+    sid    = "AllowKeyAdministration"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = [data.aws_caller_identity.current.arn]
+    }
+
+    actions = [
+      "kms:Create*",
+      "kms:Describe*",
+      "kms:Enable*",
+      "kms:List*",
+      "kms:Put*",
+      "kms:Update*",
+      "kms:Revoke*",
+      "kms:Disable*",
+      "kms:Get*",
+      "kms:Delete*",
+      "kms:ScheduleKeyDeletion",
+      "kms:CancelKeyDeletion",
+    ]
+    resources = ["*"]
+  }
+}
+
+# ============================================================
 # KMS Key for EBS Volume Encryption
-# A customer-managed KMS key is used instead of the AWS-managed
-# default key (aws/ebs) so that key policy, rotation, and ARN
-# are fully visible and auditable in this Terraform state.
 # ============================================================
 resource "aws_kms_key" "ebs" {
   description             = "KMS key for RKE2 cluster EBS volume encryption (${var.cluster_name})"
   deletion_window_in_days = 7
   enable_key_rotation     = true
+  policy                  = data.aws_iam_policy_document.ebs_kms.json
 
   tags = merge(var.tags, {
     Name = "${var.cluster_name}-ebs-kms-key"
@@ -151,10 +263,10 @@ module "rke2" {
 module "rke2_workers" {
   source = "git::https://github.com/rancherfederal/rke2-aws-tf.git//modules/agent-nodepool?ref=v2.5.1"
 
-  name   = "workers"
-  vpc_id = var.vpc_id
+  name    = "workers"
+  vpc_id  = var.vpc_id
   subnets = [var.worker_subnet_id]
-  ami    = var.ami_id
+  ami     = var.ami_id
 
   # Instance configuration
   instance_type = var.worker_instance_type
@@ -220,9 +332,9 @@ module "rke2_workers" {
 # Uses an Elastic IP for a stable public address.
 # ============================================================
 resource "aws_lb" "app" {
-  name                       = "${var.cluster_name}-app-nlb"
-  internal                   = false
-  load_balancer_type         = "network"
+  name               = "${var.cluster_name}-app-nlb"
+  internal           = false
+  load_balancer_type = "network"
 
   # Use the pre-allocated EIP for a stable public IP
   subnet_mapping {

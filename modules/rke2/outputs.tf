@@ -24,6 +24,25 @@ output "worker_nodepool_id" {
 }
 
 # ============================================================
+# KMS Key Outputs
+# ============================================================
+
+output "ebs_kms_key_arn" {
+  description = "ARN of the KMS key used to encrypt all cluster EBS volumes"
+  value       = aws_kms_key.ebs.arn
+}
+
+output "ebs_kms_key_id" {
+  description = "ID of the KMS key used to encrypt all cluster EBS volumes"
+  value       = aws_kms_key.ebs.key_id
+}
+
+output "ebs_kms_key_alias" {
+  description = "Alias of the KMS key used to encrypt all cluster EBS volumes"
+  value       = aws_kms_alias.ebs.name
+}
+
+# ============================================================
 # Node IP Outputs
 # The CP ASG name is derived from the worker nodepool_id by
 # replacing "workers-agent" with "server" — both are created
@@ -32,7 +51,6 @@ output "worker_nodepool_id" {
 # e.g. rke2-prod-3wh-workers-agent-rke2-nodepool
 #   -> rke2-prod-3wh-server-rke2-nodepool
 # ============================================================
-
 locals {
   cp_asg_name = replace(module.rke2_workers.nodepool_id, "workers-agent", "server")
 }

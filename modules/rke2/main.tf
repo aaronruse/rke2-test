@@ -6,7 +6,7 @@ locals {
     service-cidr = var.service_cidr
 
     # CoreDNS is the default in RKE2 — explicitly set for clarity
-    cluster-dns = cidrhost(var.service_cidr, 10)  # e.g. 10.96.0.10
+    cluster-dns = cidrhost(var.service_cidr, 10) # e.g. 10.96.0.10
 
     # NOTE: Do NOT set node-role.kubernetes.io/control-plane here.
     # The kubelet in k8s 1.26 rejects self-applied kubernetes.io labels
@@ -66,6 +66,27 @@ locals {
 }
 
 # ============================================================
+# KMS Key for EBS Volume Encryption
+# A customer-managed KMS key is used instead of the AWS-managed
+# default key (aws/ebs) so that key policy, rotation, and ARN
+# are fully visible and auditable in this Terraform state.
+# ============================================================
+resource "aws_kms_key" "ebs" {
+  description             = "KMS key for RKE2 cluster EBS volume encryption (${var.cluster_name})"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+
+  tags = merge(var.tags, {
+    Name = "${var.cluster_name}-ebs-kms-key"
+  })
+}
+
+resource "aws_kms_alias" "ebs" {
+  name          = "alias/${var.cluster_name}-ebs"
+  target_key_id = aws_kms_key.ebs.key_id
+}
+
+# ============================================================
 # RKE2 Server (Control Plane) — rancherfederal module
 # ============================================================
 module "rke2" {
@@ -80,11 +101,12 @@ module "rke2" {
   instance_type = var.control_plane_instance_type
   servers       = var.control_plane_count
 
-  # Disk
+  # Disk — encrypted with the customer-managed KMS key
   block_device_mappings = {
-    size      = tostring(var.control_plane_disk_size_gb)
-    encrypted = "true"
-    type      = "gp3"
+    size       = tostring(var.control_plane_disk_size_gb)
+    encrypted  = "true"
+    kms_key_id = aws_kms_key.ebs.arn
+    type       = "gp3"
   }
 
   # SSH
@@ -129,10 +151,10 @@ module "rke2" {
 module "rke2_workers" {
   source = "git::https://github.com/rancherfederal/rke2-aws-tf.git//modules/agent-nodepool?ref=v2.5.1"
 
-  name    = "workers"
-  vpc_id  = var.vpc_id
+  name   = "workers"
+  vpc_id = var.vpc_id
   subnets = [var.worker_subnet_id]
-  ami     = var.ami_id
+  ami    = var.ami_id
 
   # Instance configuration
   instance_type = var.worker_instance_type
@@ -154,11 +176,12 @@ module "rke2_workers" {
     desired = var.worker_count
   }
 
-  # 350GB root disk
+  # Disk — encrypted with the customer-managed KMS key
   block_device_mappings = {
-    size      = tostring(var.worker_disk_size_gb)
-    encrypted = "true"
-    type      = "gp3"
+    size       = tostring(var.worker_disk_size_gb)
+    encrypted  = "true"
+    kms_key_id = aws_kms_key.ebs.arn
+    type       = "gp3"
   }
 
   # SSH
@@ -197,9 +220,9 @@ module "rke2_workers" {
 # Uses an Elastic IP for a stable public address.
 # ============================================================
 resource "aws_lb" "app" {
-  name               = "${var.cluster_name}-app-nlb"
-  internal           = false
-  load_balancer_type = "network"
+  name                       = "${var.cluster_name}-app-nlb"
+  internal                   = false
+  load_balancer_type         = "network"
 
   # Use the pre-allocated EIP for a stable public IP
   subnet_mapping {

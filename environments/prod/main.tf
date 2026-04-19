@@ -206,11 +206,28 @@ output "nat_gateway_public_ip" {
   value       = module.networking.nat_gateway_public_ip
 }
 
+# ============================================================
+# KMS Key Outputs
+# ============================================================
+output "ebs_kms_key_arn" {
+  description = "ARN of the KMS key used to encrypt all cluster EBS volumes"
+  value       = module.rke2.ebs_kms_key_arn
+}
+
+output "ebs_kms_key_id" {
+  description = "ID of the KMS key used to encrypt all cluster EBS volumes"
+  value       = module.rke2.ebs_kms_key_id
+}
+
+output "ebs_kms_key_alias" {
+  description = "Alias of the KMS key used to encrypt all cluster EBS volumes"
+  value       = module.rke2.ebs_kms_key_alias
+}
+
 output "ssh_connect_instructions" {
   description = "How to SSH into cluster nodes via bastion"
   value       = <<-INSTRUCTIONS
     # ---- SSH Access Instructions ----
-
     # 1. Add your private key to the SSH agent (enables agent forwarding):
     ssh-add ~/.ssh/id_rsa   # or your actual private key path
 

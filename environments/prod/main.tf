@@ -4,15 +4,12 @@ terraform {
   # ============================================================
   # Remote Backend — S3 + DynamoDB state locking
   #
-  # IMPORTANT: The bucket and DynamoDB table must exist before
-  # running `terraform init` with this backend. Bootstrap them
-  # first by temporarily commenting out this block, running:
-  #   terraform init && terraform apply -target=aws_s3_bucket.tfstate \
-  #     -target=aws_dynamodb_table.tfstate_lock
-  # Then uncomment this block and run `terraform init` again to
-  # migrate local state into the bucket.
+  # The bucket and DynamoDB table are provisioned by the
+  # bootstrap root at environments/prod/bootstrap/.
+  # Run that first, then fill in the values below from its
+  # outputs and run `terraform init` here to migrate state.
   #
-  # Values here cannot use variables — they must be hardcoded.
+  # Values cannot use Terraform variables — must be hardcoded.
   # ============================================================
   backend "s3" {
     bucket         = "rke2-prod-tfstate-641275310402"
@@ -20,9 +17,6 @@ terraform {
     region         = "us-west-2"
     dynamodb_table = "rke2-prod-tfstate-lock"
     encrypt        = true
-    # kms_key_id is optional here — the bucket's default KMS key
-    # (set in aws_s3_bucket_server_side_encryption_configuration)
-    # will be used automatically for state file encryption.
   }
 
   required_providers {
@@ -76,9 +70,6 @@ locals {
 
 # ============================================================
 # Bastion Module
-# Creates the bastion EC2 instance, IAM instance profile,
-# and SSH key pair. The instance ID is passed to networking
-# so the EIP can be associated after the instance exists.
 # ============================================================
 module "bastion" {
   source = "../../modules/bastion"
@@ -97,8 +88,6 @@ module "bastion" {
 
 # ============================================================
 # Networking Module
-# VPC, subnets, IGW, NAT gateway, route tables, and EIPs.
-# Depends on bastion for the bastion EIP association.
 # ============================================================
 module "networking" {
   source = "../../modules/networking"
@@ -115,7 +104,6 @@ module "networking" {
 
 # ============================================================
 # Security Groups Module
-# Bastion, control plane, and worker security groups.
 # ============================================================
 module "securitygroups" {
   source = "../../modules/securitygroups"
@@ -128,8 +116,6 @@ module "securitygroups" {
 
 # ============================================================
 # RKE2 Module
-# Control plane, worker nodepool, application NLB, and
-# NLB listeners/target groups/ASG attachments.
 # ============================================================
 module "rke2" {
   source = "../../modules/rke2"
@@ -157,7 +143,7 @@ module "rke2" {
   control_plane_disk_size_gb  = var.control_plane_disk_size_gb
   worker_disk_size_gb         = var.worker_disk_size_gb
 
-  # SSH — key content read from disk via ssh_keys.tf locals
+  # SSH
   ssh_public_key = local.ssh_public_key
 
   # RKE2
@@ -245,24 +231,14 @@ output "ebs_kms_key_alias" {
   value       = aws_kms_alias.ebs.name
 }
 
-output "tfstate_bucket" {
-  description = "S3 bucket holding Terraform state, SSH public key, and outputs snapshot"
-  value       = aws_s3_bucket.tfstate.bucket
-}
-
-output "tfstate_dynamodb_table" {
-  description = "DynamoDB table used for Terraform state locking"
-  value       = aws_dynamodb_table.tfstate_lock.name
-}
-
 output "ssh_public_key_s3_path" {
   description = "S3 path of the uploaded SSH public key"
-  value       = "s3://${aws_s3_bucket.tfstate.bucket}/${aws_s3_object.ssh_public_key.key}"
+  value       = "s3://${local.tfstate_bucket}/${aws_s3_object.ssh_public_key.key}"
 }
 
 output "tf_outputs_s3_path" {
   description = "S3 path of the Terraform outputs JSON snapshot"
-  value       = "s3://${aws_s3_bucket.tfstate.bucket}/${aws_s3_object.tf_outputs.key}"
+  value       = "s3://${local.tfstate_bucket}/${aws_s3_object.tf_outputs.key}"
 }
 
 output "ssh_connect_instructions" {
@@ -275,7 +251,7 @@ output "ssh_connect_instructions" {
     # 2. SSH into the bastion (ForwardAgent enables jumping to internal nodes):
     ssh -A ubuntu@${module.networking.bastion_eip_public_ip}
 
-    # 3. From the bastion, SSH into the control plane node (get IP from AWS console or below):
+    # 3. From the bastion, SSH into the control plane node:
     ssh ubuntu@<control-plane-private-ip>
 
     # 4. From the bastion, SSH into a worker node:

@@ -40,8 +40,8 @@ data "aws_iam_policy_document" "bastion" {
   }
 
   # ---- S3: Terraform state bucket read access ----
-  # Allows the bastion to read state, SSH key, and outputs
-  # snapshot from the tfstate bucket for operational use.
+  # The bucket is managed by the bootstrap root so we reference
+  # it by its known name rather than a resource attribute.
   statement {
     sid    = "S3TFStateRead"
     effect = "Allow"
@@ -51,8 +51,8 @@ data "aws_iam_policy_document" "bastion" {
       "s3:GetBucketLocation",
     ]
     resources = [
-      aws_s3_bucket.tfstate.arn,
-      "${aws_s3_bucket.tfstate.arn}/*",
+      "arn:aws:s3:::${local.tfstate_bucket}",
+      "arn:aws:s3:::${local.tfstate_bucket}/*",
     ]
   }
 
@@ -67,7 +67,7 @@ data "aws_iam_policy_document" "bastion" {
       "dynamodb:DescribeTable",
     ]
     resources = [
-      aws_dynamodb_table.tfstate_lock.arn,
+      "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/${var.cluster_name}-tfstate-lock",
     ]
   }
 
@@ -268,7 +268,6 @@ resource "aws_iam_instance_profile" "bastion" {
 #      can manage the key lifecycle.
 # ============================================================
 data "aws_iam_policy_document" "ebs_kms" {
-  # Statement 1 — root account ownership / IAM delegation
   statement {
     sid    = "EnableRootAccountAccess"
     effect = "Allow"
@@ -282,7 +281,6 @@ data "aws_iam_policy_document" "ebs_kms" {
     resources = ["*"]
   }
 
-  # Statement 2 — AutoScaling service-linked role encryption permissions
   statement {
     sid    = "AllowAutoScalingEncryption"
     effect = "Allow"
@@ -304,8 +302,6 @@ data "aws_iam_policy_document" "ebs_kms" {
     resources = ["*"]
   }
 
-  # Statement 3 — AutoScaling CreateGrant (required separately)
-  # Restricted to AWS service use only via GrantIsForAWSResource.
   statement {
     sid    = "AllowAutoScalingCreateGrant"
     effect = "Allow"
@@ -327,7 +323,6 @@ data "aws_iam_policy_document" "ebs_kms" {
     }
   }
 
-  # Statement 4 — key administrator (IAM identity running Terraform)
   statement {
     sid    = "AllowKeyAdministration"
     effect = "Allow"

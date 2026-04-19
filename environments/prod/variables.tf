@@ -182,7 +182,7 @@ variable "wait_for_capacity_timeout" {
     to bootstrap than standard images — 20m is recommended over the default 10m.
   DESC
   type        = string
-  default     = "20m"
+  default     = "10m"
 }
 
 # ============================================================

@@ -1,131 +1,30 @@
 # ============================================================
-# S3 Bucket — Terraform state, SSH public key, and outputs
+# S3 Objects — SSH public key and Terraform outputs snapshot
 #
-# A single bucket holds three things:
-#   state/terraform.tfstate  — Terraform remote state
-#   ssh/rke2_id_ed25519.pub  — SSH public key (for reference/auditing)
-#   outputs/terraform.json   — Terraform outputs snapshot post-apply
+# The S3 bucket and DynamoDB lock table live in the bootstrap
+# root (environments/prod/bootstrap/) and are managed there.
+# This file only writes objects into the existing bucket.
 #
-# Versioning is enabled so every state file write is retained,
-# allowing rollback to any previous state revision.
-# The bucket is encrypted with the same KMS key used for EBS.
-# Public access is fully blocked.
-# ============================================================
-resource "aws_s3_bucket" "tfstate" {
-  bucket = "${var.cluster_name}-tfstate-${data.aws_caller_identity.current.account_id}"
-
-  # Prevent accidental deletion of the bucket while state is inside it.
-  # Set to false only when intentionally tearing down the entire environment.
-  lifecycle {
-    prevent_destroy = true
-  }
-
-  tags = merge(local.tags, {
-    Name    = "${var.cluster_name}-tfstate"
-    Purpose = "terraform-state"
-  })
-}
-
-# Block all public access — state files must never be public
-resource "aws_s3_bucket_public_access_block" "tfstate" {
-  bucket = aws_s3_bucket.tfstate.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# Enable versioning so every state write is retained
-resource "aws_s3_bucket_versioning" "tfstate" {
-  bucket = aws_s3_bucket.tfstate.id
-
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-# Encrypt the bucket with the cluster KMS key
-resource "aws_s3_bucket_server_side_encryption_configuration" "tfstate" {
-  bucket = aws_s3_bucket.tfstate.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm     = "aws:kms"
-      kms_master_key_id = aws_kms_key.ebs.arn
-    }
-    # Enforce KMS encryption — disallow unencrypted uploads
-    bucket_key_enabled = true
-  }
-}
-
-# Enforce TLS-only access to the bucket
-resource "aws_s3_bucket_policy" "tfstate" {
-  bucket = aws_s3_bucket.tfstate.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid       = "DenyNonTLS"
-        Effect    = "Deny"
-        Principal = "*"
-        Action    = "s3:*"
-        Resource = [
-          aws_s3_bucket.tfstate.arn,
-          "${aws_s3_bucket.tfstate.arn}/*",
-        ]
-        Condition = {
-          Bool = {
-            "aws:SecureTransport" = "false"
-          }
-        }
-      }
-    ]
-  })
-}
-
-# ============================================================
-# DynamoDB Table — Terraform state locking
-# Prevents concurrent applies from corrupting the state file.
-# ============================================================
-resource "aws_dynamodb_table" "tfstate_lock" {
-  name         = "${var.cluster_name}-tfstate-lock"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "LockID"
-
-  attribute {
-    name = "LockID"
-    type = "S"
-  }
-
-  # Encrypt the lock table with the cluster KMS key
-  server_side_encryption {
-    enabled     = true
-    kms_key_arn = aws_kms_key.ebs.arn
-  }
-
-  tags = merge(local.tags, {
-    Name    = "${var.cluster_name}-tfstate-lock"
-    Purpose = "terraform-state-lock"
-  })
-}
-
-# ============================================================
-# S3 Objects — SSH public key and Terraform outputs
+# Two objects are written on every apply:
+#   ssh/rke2_id_ed25519.pub  — the SSH public key for auditing
+#   outputs/terraform.json   — snapshot of all Terraform outputs
 #
-# These are written after apply so the bucket always holds the
-# current SSH key and a snapshot of all Terraform outputs.
-# Both objects are encrypted via the bucket's default KMS key.
+# Both are encrypted with the EBS KMS key via the bucket's
+# default server-side encryption configuration.
 # ============================================================
+
+locals {
+  # Bucket name matches what bootstrap creates — must stay in sync
+  # with the bucket_name local in environments/prod/bootstrap/main.tf
+  tfstate_bucket = "${var.cluster_name}-tfstate-${data.aws_caller_identity.current.account_id}"
+}
 
 # Upload the SSH public key used by the cluster
 resource "aws_s3_object" "ssh_public_key" {
-  bucket  = aws_s3_bucket.tfstate.id
+  bucket  = local.tfstate_bucket
   key     = "ssh/rke2_id_ed25519.pub"
   content = local.ssh_public_key
 
-  # Object inherits bucket KMS encryption — no extra config needed
   server_side_encryption = "aws:kms"
   kms_key_id             = aws_kms_key.ebs.arn
 
@@ -137,7 +36,7 @@ resource "aws_s3_object" "ssh_public_key" {
 
 # Upload a JSON snapshot of all Terraform outputs
 resource "aws_s3_object" "tf_outputs" {
-  bucket = aws_s3_bucket.tfstate.id
+  bucket = local.tfstate_bucket
   key    = "outputs/terraform.json"
 
   content = jsonencode({

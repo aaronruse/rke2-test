@@ -3,13 +3,7 @@ terraform {
 
   # ============================================================
   # Remote Backend — S3 + DynamoDB state locking
-  #
-  # The bucket and DynamoDB table are provisioned by the
-  # bootstrap root at environments/prod/bootstrap/.
-  # Run that first, then fill in the values below from its
-  # outputs and run `terraform init` here to migrate state.
-  #
-  # Values cannot use Terraform variables — must be hardcoded.
+  # Bucket and table are provisioned by environments/prod/bootstrap/
   # ============================================================
   backend "s3" {
     bucket         = "rke2-prod-tfstate-641275310402"
@@ -145,6 +139,9 @@ module "rke2" {
 
   # SSH
   ssh_public_key = local.ssh_public_key
+
+  # KMS key for EBS encryption — created in iam.tf
+  ebs_kms_key_arn = aws_kms_key.ebs.arn
 
   # RKE2
   rke2_version              = var.rke2_version

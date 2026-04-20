@@ -66,139 +66,6 @@ locals {
 }
 
 # ============================================================
-# Data sources needed for KMS key policy
-# ============================================================
-data "aws_caller_identity" "current" {}
-data "aws_region" "current" {}
-
-# ============================================================
-# KMS Key Policy
-# EC2 and the Auto Scaling service need explicit permission to
-# use a customer-managed KMS key for EBS encryption. Without
-# this policy the instances fail to launch because the service
-# cannot encrypt/decrypt the root volume, causing the ASG to
-# report 0 healthy instances and Terraform to time out.
-#
-# Three statements are required:
-#   1. Root account full access — allows IAM policies to delegate
-#      key access and prevents permanent lock-out.
-#   2. EC2 autoscaling service — allows the service-linked role
-#      used by Auto Scaling to create encrypted volumes when
-#      launching instances from a launch template.
-#   3. Key administrators — allows Terraform's caller identity
-#      (the IAM user/role running the apply) to manage the key.
-# ============================================================
-data "aws_iam_policy_document" "ebs_kms" {
-  # Statement 1 — root account ownership / IAM delegation
-  statement {
-    sid    = "EnableRootAccountAccess"
-    effect = "Allow"
-
-    principals {
-      type        = "AWS"
-      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
-    }
-
-    actions   = ["kms:*"]
-    resources = ["*"]
-  }
-
-  # Statement 2 — Auto Scaling service-linked role encryption permissions
-  # The Auto Scaling service-linked role needs these actions to create
-  # encrypted EBS volumes when launching instances from a launch template.
-  statement {
-    sid    = "AllowAutoScalingEncryption"
-    effect = "Allow"
-
-    principals {
-      type = "AWS"
-      identifiers = [
-        "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
-      ]
-    }
-
-    actions = [
-      "kms:Encrypt",
-      "kms:Decrypt",
-      "kms:ReEncrypt*",
-      "kms:GenerateDataKey*",
-      "kms:DescribeKey",
-    ]
-    resources = ["*"]
-  }
-
-  # Statement 3 — CreateGrant for Auto Scaling (required separately)
-  # Allows Auto Scaling to grant the EBS volume access to the instance.
-  # The GrantIsForAWSResource condition restricts this to AWS service use only.
-  statement {
-    sid    = "AllowAutoScalingCreateGrant"
-    effect = "Allow"
-
-    principals {
-      type = "AWS"
-      identifiers = [
-        "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
-      ]
-    }
-
-    actions   = ["kms:CreateGrant"]
-    resources = ["*"]
-
-    condition {
-      test     = "Bool"
-      variable = "kms:GrantIsForAWSResource"
-      values   = ["true"]
-    }
-  }
-
-  # Statement 4 — key administrator (the IAM identity running Terraform)
-  statement {
-    sid    = "AllowKeyAdministration"
-    effect = "Allow"
-
-    principals {
-      type        = "AWS"
-      identifiers = [data.aws_caller_identity.current.arn]
-    }
-
-    actions = [
-      "kms:Create*",
-      "kms:Describe*",
-      "kms:Enable*",
-      "kms:List*",
-      "kms:Put*",
-      "kms:Update*",
-      "kms:Revoke*",
-      "kms:Disable*",
-      "kms:Get*",
-      "kms:Delete*",
-      "kms:ScheduleKeyDeletion",
-      "kms:CancelKeyDeletion",
-    ]
-    resources = ["*"]
-  }
-}
-
-# ============================================================
-# KMS Key for EBS Volume Encryption
-# ============================================================
-resource "aws_kms_key" "ebs" {
-  description             = "KMS key for RKE2 cluster EBS volume encryption (${var.cluster_name})"
-  deletion_window_in_days = 7
-  enable_key_rotation     = true
-  policy                  = data.aws_iam_policy_document.ebs_kms.json
-
-  tags = merge(var.tags, {
-    Name = "${var.cluster_name}-ebs-kms-key"
-  })
-}
-
-resource "aws_kms_alias" "ebs" {
-  name          = "alias/${var.cluster_name}-ebs"
-  target_key_id = aws_kms_key.ebs.key_id
-}
-
-# ============================================================
 # RKE2 Server (Control Plane) — rancherfederal module
 # ============================================================
 module "rke2" {
@@ -209,32 +76,27 @@ module "rke2" {
   subnets      = [var.control_plane_subnet_id]
   ami          = var.ami_id
 
-  # Instance configuration
   instance_type = var.control_plane_instance_type
   servers       = var.control_plane_count
 
-  # Disk — encrypted with the customer-managed KMS key
+  # Disk — encrypted with the KMS key created in environments/prod/iam.tf
+  # and passed in via var.ebs_kms_key_arn. Keeping the key outside this
+  # module ensures it is properly tracked and destroyed with the prod root,
+  # preventing the AlreadyExists errors that occur when the alias survives
+  # a failed destroy cycle.
   block_device_mappings = {
     size       = tostring(var.control_plane_disk_size_gb)
     encrypted  = "true"
-    kms_key_id = aws_kms_key.ebs.arn
+    kms_key_id = var.ebs_kms_key_arn
     type       = "gp3"
   }
 
-  # SSH
-  ssh_authorized_keys = [var.ssh_public_key]
-
-  # Keep control plane internal (not publicly accessible) — best practice
+  ssh_authorized_keys   = [var.ssh_public_key]
   controlplane_internal = true
+  rke2_version          = var.rke2_version
+  rke2_channel          = var.rke2_channel
+  rke2_config           = local.rke2_server_config
 
-  # RKE2 version
-  rke2_version = var.rke2_version
-  rke2_channel = var.rke2_channel
-
-  # RKE2 cluster networking config
-  rke2_config = local.rke2_server_config
-
-  # IMDSv2 enforced
   metadata_options = {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
@@ -242,16 +104,9 @@ module "rke2" {
     instance_metadata_tags      = "disabled"
   }
 
-  # SSH hardening userdata (pre-RKE2)
-  pre_userdata = local.ssh_hardening_userdata
-
-  # Security group additions — allow workers and bastion to communicate with CP
+  pre_userdata             = local.ssh_hardening_userdata
   extra_security_group_ids = [var.control_plane_sg_id]
-
-  # ASG termination policy
-  termination_policies = ["Default"]
-
-  # Increase timeout for CIS hardened image bootstrap (default is 10m)
+  termination_policies     = ["Default"]
   wait_for_capacity_timeout = var.wait_for_capacity_timeout
 
   tags = var.tags
@@ -268,45 +123,28 @@ module "rke2_workers" {
   subnets = [var.worker_subnet_id]
   ami     = var.ami_id
 
-  # Instance configuration
   instance_type = var.worker_instance_type
+  spot          = var.worker_spot
 
-  # Spot instances — enabled for cost reduction (~60-70% cheaper than On-Demand).
-  # AWS may reclaim spot instances with a 2-minute warning. The ASG will
-  # automatically replace interrupted nodes; RKE2 will reschedule pods onto
-  # the replacement. Ensure your workloads tolerate brief pod restarts.
-  # Toggle via var.worker_spot in terraform.tfvars.
-  spot = var.worker_spot
-
-  # ASG sizing:
-  # - min/desired = worker_count (4) — maintain the target fleet size
-  # - max = worker_count + 2 — gives the ASG headroom to launch replacement
-  #   nodes before terminating interrupted spot instances, avoiding a gap
   asg = {
     min     = var.worker_count
     max     = var.worker_count + 2
     desired = var.worker_count
   }
 
-  # Disk — encrypted with the customer-managed KMS key
+  # Disk — same KMS key as control plane
   block_device_mappings = {
     size       = tostring(var.worker_disk_size_gb)
     encrypted  = "true"
-    kms_key_id = aws_kms_key.ebs.arn
+    kms_key_id = var.ebs_kms_key_arn
     type       = "gp3"
   }
 
-  # SSH
   ssh_authorized_keys = [var.ssh_public_key]
+  rke2_version        = var.rke2_version
+  rke2_channel        = var.rke2_channel
+  rke2_config         = local.rke2_agent_config
 
-  # RKE2 version
-  rke2_version = var.rke2_version
-  rke2_channel = var.rke2_channel
-
-  # RKE2 agent config
-  rke2_config = local.rke2_agent_config
-
-  # IMDSv2 enforced
   metadata_options = {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
@@ -314,29 +152,21 @@ module "rke2_workers" {
     instance_metadata_tags      = "disabled"
   }
 
-  # SSH hardening userdata (pre-RKE2)
-  pre_userdata = local.ssh_hardening_userdata
-
-  # Security group additions — attach worker SG
+  pre_userdata             = local.ssh_hardening_userdata
   extra_security_group_ids = [var.workers_sg_id]
-
-  # Join the cluster created by the rke2 module
-  cluster_data = module.rke2.cluster_data
+  cluster_data             = module.rke2.cluster_data
 
   tags = var.tags
 }
 
 # ============================================================
 # Application Network Load Balancer (Worker-Facing)
-# Sits in front of the 4 worker nodes for application traffic.
-# Uses an Elastic IP for a stable public address.
 # ============================================================
 resource "aws_lb" "app" {
   name               = "${var.cluster_name}-app-nlb"
   internal           = false
   load_balancer_type = "network"
 
-  # Use the pre-allocated EIP for a stable public IP
   subnet_mapping {
     subnet_id     = var.bastion_subnet_id
     allocation_id = var.worker_nlb_eip_id
@@ -350,7 +180,6 @@ resource "aws_lb" "app" {
   })
 }
 
-# Target Group — HTTP (80) to worker NodePort for ingress-nginx HTTP
 resource "aws_lb_target_group" "http" {
   name        = "${var.cluster_name}-tg-http"
   port        = 80
@@ -371,7 +200,6 @@ resource "aws_lb_target_group" "http" {
   })
 }
 
-# Target Group — HTTPS (443) to worker NodePort for ingress-nginx HTTPS
 resource "aws_lb_target_group" "https" {
   name        = "${var.cluster_name}-tg-https"
   port        = 443
@@ -392,7 +220,6 @@ resource "aws_lb_target_group" "https" {
   })
 }
 
-# NLB Listener: HTTP port 80 -> worker target group
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.app.arn
   port              = 80
@@ -404,7 +231,6 @@ resource "aws_lb_listener" "http" {
   }
 }
 
-# NLB Listener: HTTPS port 443 -> worker target group
 resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.app.arn
   port              = 443
@@ -416,7 +242,6 @@ resource "aws_lb_listener" "https" {
   }
 }
 
-# Attach worker ASG to the NLB target groups
 resource "aws_autoscaling_attachment" "workers_http" {
   autoscaling_group_name = module.rke2_workers.nodepool_id
   lb_target_group_arn    = aws_lb_target_group.http.arn

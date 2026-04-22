@@ -18,7 +18,12 @@
 #     NotReady nodes left over from the previous run are
 #     removed from the Kubernetes API server.
 #
-# Reads state saved by cluster-stop.sh from ~/.rke2-cluster-state/
+# State is pulled from s3://<tfstate-bucket>/cluster-state/
+# so any collaborator with AWS access can start the cluster,
+# regardless of which machine last ran cluster-stop.sh.
+# Falls back to ~/.rke2-cluster-state/ if S3 files are not found.
+#
+# Dependencies: aws CLI, jq
 #
 # Usage:
 #   bash scripts/cluster-start.sh
@@ -33,6 +38,7 @@ CLUSTER_NAME="rke2-prod"
 REGION="us-west-2"
 STATE_DIR="$HOME/.rke2-cluster-state"
 TFSTATE_BUCKET="rke2-prod-tfstate-641275310402"
+S3_STATE_PREFIX="s3://${TFSTATE_BUCKET}/cluster-state"
 KUBECONFIG_PATH="$HOME/.kube/config"
 
 # How long to wait for workers to join before cleaning up ghost nodes.
@@ -49,8 +55,7 @@ if ! command -v jq &>/dev/null; then
   echo ""
   echo "ERROR: jq is not installed but is required by this script."
   echo ""
-  echo "  jq is used to parse the saved worker ASG state from:"
-  echo "    $STATE_DIR/worker-asg-state.json"
+  echo "  jq is used to parse the saved worker ASG state from S3."
   echo ""
   echo "  Install it with:"
   echo "    sudo dnf install -y jq"
@@ -60,6 +65,39 @@ if ! command -v jq &>/dev/null; then
   echo ""
   exit 1
 fi
+
+if ! command -v aws &>/dev/null; then
+  echo ""
+  echo "ERROR: aws CLI is not installed but is required by this script."
+  echo ""
+  echo "  Install it by running the bootstrap script:"
+  echo "    bash scripts/bootstrap-rhel8.sh"
+  echo ""
+  exit 1
+fi
+
+mkdir -p "$STATE_DIR"
+
+# ============================================================
+# Pull state files from S3
+# Downloads all cluster state files written by cluster-stop.sh
+# into the local state directory. Falls back gracefully to any
+# existing local files if S3 files are not present.
+# ============================================================
+echo "==> Syncing cluster state from S3..."
+
+for FILE in cp-instance-id.txt cp-asg-name.txt bastion-instance-id.txt worker-asg-state.json; do
+  if aws s3 cp "${S3_STATE_PREFIX}/${FILE}" "$STATE_DIR/$FILE" \
+      --region "$REGION" > /dev/null 2>&1; then
+    echo "      Downloaded: $FILE"
+  else
+    if [ -f "$STATE_DIR/$FILE" ]; then
+      echo "      S3 not found, using local: $FILE"
+    else
+      echo "      WARNING: $FILE not found in S3 or locally"
+    fi
+  fi
+done
 
 echo "==> Starting cluster: $CLUSTER_NAME"
 
@@ -105,7 +143,7 @@ echo "==> [Control Plane] Starting control plane instance..."
 if [ -f "$STATE_DIR/cp-instance-id.txt" ]; then
   CP_INSTANCE=$(cat "$STATE_DIR/cp-instance-id.txt")
 else
-  echo "      ERROR: No saved control plane instance ID found at $STATE_DIR/cp-instance-id.txt"
+  echo "      ERROR: No saved control plane instance ID found."
   echo "      Was cluster-stop.sh run before this? Cannot safely start control plane."
   exit 1
 fi
@@ -146,7 +184,7 @@ if [ -f "$STATE_DIR/worker-asg-state.json" ]; then
   WORKER_MAX=$(jq -r '.max' "$STATE_DIR/worker-asg-state.json")
   WORKER_DESIRED=$(jq -r '.desired' "$STATE_DIR/worker-asg-state.json")
 else
-  echo "      No saved worker state found — using defaults (min=4 max=6 desired=4)"
+  echo "      No saved worker state found in S3 or locally — using defaults (min=4 max=6 desired=4)"
   WORKER_ASG=$(aws autoscaling describe-auto-scaling-groups \
     --region "$REGION" \
     --query "AutoScalingGroups[?contains(Tags[?Key=='Project'].Value, '${CLUSTER_NAME}') && contains(AutoScalingGroupName, 'worker')].AutoScalingGroupName" \

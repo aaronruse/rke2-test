@@ -17,7 +17,9 @@
 #
 #   Bastion (on-demand) — stopped directly.
 #
-# State is saved to ~/.rke2-cluster-state/ for use by cluster-start.sh
+# State is saved to both ~/.rke2-cluster-state/ (local) and
+# s3://<tfstate-bucket>/cluster-state/ so that collaborators
+# can start the cluster from any machine with AWS access.
 #
 # Dependencies: aws CLI (no jq required — state is written via heredoc)
 #
@@ -30,6 +32,8 @@ set -euo pipefail
 CLUSTER_NAME="rke2-prod"
 REGION="us-west-2"
 STATE_DIR="$HOME/.rke2-cluster-state"
+TFSTATE_BUCKET="rke2-prod-tfstate-641275310402"
+S3_STATE_PREFIX="s3://${TFSTATE_BUCKET}/cluster-state"
 
 # ============================================================
 # Dependency check — aws CLI is required.
@@ -48,6 +52,15 @@ if ! command -v aws &>/dev/null; then
 fi
 
 mkdir -p "$STATE_DIR"
+
+# ---- Helper: save a state file locally and to S3 ----
+save_state() {
+  local filename="$1"
+  local content="$2"
+  echo "$content" > "$STATE_DIR/$filename"
+  aws s3 cp "$STATE_DIR/$filename" "${S3_STATE_PREFIX}/${filename}" \
+    --region "$REGION" > /dev/null
+}
 
 echo "==> Stopping cluster: $CLUSTER_NAME"
 
@@ -110,7 +123,7 @@ WORKER_MAX=$(aws autoscaling describe-auto-scaling-groups \
   --query "AutoScalingGroups[0].MaxSize" \
   --output text)
 
-# Save worker ASG state for start script (written via heredoc — no jq needed)
+# Save worker ASG state locally and to S3
 cat > "$STATE_DIR/worker-asg-state.json" <<EOF
 {
   "asg_name": "$WORKER_ASG",
@@ -120,7 +133,11 @@ cat > "$STATE_DIR/worker-asg-state.json" <<EOF
 }
 EOF
 
-echo "      Saved: min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED"
+aws s3 cp "$STATE_DIR/worker-asg-state.json" \
+  "${S3_STATE_PREFIX}/worker-asg-state.json" \
+  --region "$REGION" > /dev/null
+
+echo "      Saved locally and to s3: min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED"
 
 # Ensure all ASG processes are resumed so the ASG can act
 echo "==> [Workers] Ensuring all ASG processes are resumed..."
@@ -209,8 +226,9 @@ if [ -z "$CP_INSTANCE" ]; then
   echo "      No running control plane instance found — skipping stop."
 else
   echo "==> [Control Plane] Stopping instance: $CP_INSTANCE"
-  echo "$CP_INSTANCE" > "$STATE_DIR/cp-instance-id.txt"
-  echo "$CP_ASG" > "$STATE_DIR/cp-asg-name.txt"
+
+  save_state "cp-instance-id.txt" "$CP_INSTANCE"
+  save_state "cp-asg-name.txt" "$CP_ASG"
 
   aws ec2 stop-instances \
     --region "$REGION" \
@@ -241,7 +259,7 @@ BASTION_ID=$(aws ec2 describe-instances \
 
 if [ -n "$BASTION_ID" ]; then
   echo "      Stopping bastion: $BASTION_ID"
-  echo "$BASTION_ID" > "$STATE_DIR/bastion-instance-id.txt"
+  save_state "bastion-instance-id.txt" "$BASTION_ID"
   aws ec2 stop-instances --region "$REGION" --instance-ids "$BASTION_ID" > /dev/null
   aws ec2 wait instance-stopped --region "$REGION" --instance-ids "$BASTION_ID"
   echo "      Bastion stopped."
@@ -253,6 +271,7 @@ echo ""
 echo "==> Cluster stopped successfully."
 echo "    Control plane EBS/etcd data is preserved."
 echo "    Workers terminated cleanly (stateless — this is fine)."
+echo "    State files saved to: ${S3_STATE_PREFIX}/"
 echo ""
 echo "    To restart the cluster run:"
 echo "      bash scripts/cluster-start.sh"

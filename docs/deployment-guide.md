@@ -1,8 +1,7 @@
 # RKE2 Cluster Deployment Guide
 
 End-to-end runbook for deploying the RKE2 cluster on AWS from a **RHEL 8 AWS
-Workspace** terminal session. Everything — tool installation, bastion, and the
-full cluster — is deployed in a single phase directly from the workspace.
+Workspace** terminal session.
 
 ---
 
@@ -10,18 +9,25 @@ full cluster — is deployed in a single phase directly from the workspace.
 
 ```
 RHEL 8 AWS Workspace (terminal)
-  └── Run bootstrap script  — installs git, terraform, kubectl, helm, aws cli
-  └── Generate SSH key       — used for GitLab and all EC2 node access
+  └── Run bootstrap script       — installs git, terraform, kubectl, helm, aws cli
+  └── Generate SSH key           — used for GitLab and all EC2 node access
   └── Clone repo from GitLab
-  └── Configure variables
-  └── terraform apply        — deploys VPC + bastion + RKE2 cluster in one shot
-  └── Fetch kubeconfig       — verify cluster from the workspace
-  └── helm/deploy.sh         — deploy ingress-nginx, cert-manager, CoreDNS patch
+  └── Phase 1: bootstrap apply   — creates S3 state bucket, DynamoDB lock, KMS key
+  └── Phase 2: prod apply        — deploys VPC, bastion, RKE2 cluster in one shot
+  └── Fetch kubeconfig from S3   — verify cluster
 ```
 
-The control plane and worker nodes live in private subnets. The workspace
-reaches them via the bastion, which is deployed as part of the same `terraform
-apply`. There is no separate "Phase 1" — everything goes up together.
+Deployment is split into two Terraform roots:
+
+**`environments/bootstrap/`** — run once, never destroyed. Creates the S3 bucket
+used as the remote backend for prod state, the DynamoDB lock table, and a
+dedicated KMS key for state encryption. Bootstrap state is stored persistently
+at `~/.terraform-bootstrap/rke2-prod.tfstate` so it survives across sessions.
+
+**`environments/prod/`** — the main cluster. Can be applied and destroyed freely
+without touching the bootstrap bucket. Creates the VPC, networking, bastion,
+RKE2 cluster, a separate KMS key for EBS encryption, and pushes SSH keys,
+kubeconfig, and a outputs snapshot to the S3 bucket.
 
 ---
 
@@ -34,7 +40,7 @@ Your RHEL 8 workspace needs outbound internet access to reach:
 - `get.helm.sh` (Helm)
 - `awscli.amazonaws.com` (AWS CLI)
 - `github.com` (rancherfederal/rke2-aws-tf Terraform module)
-- `gitlab.com` (your repo — or your self-hosted GitLab hostname)
+- `gitlab.com` (your repo)
 
 If your workspace is behind a proxy, set `http_proxy` / `https_proxy` before
 running anything:
@@ -47,28 +53,7 @@ export no_proxy="169.254.169.254,localhost,127.0.0.1"
 
 ---
 
-## Step 1 — Clone the Bootstrap Script
-
-If you do not yet have the repo, grab just the bootstrap script first using
-HTTPS (no key needed at this point):
-
-```bash
-# Option A: you already have the repo checked out
-cd rke2-aws-infra
-
-# Option B: bootstrap from scratch — download the script directly
-curl -sSL https://gitlab.com/YOUR_NAMESPACE/rke2-aws-infra/-/raw/main/scripts/bootstrap-rhel8.sh \
-  -o bootstrap-rhel8.sh
-chmod +x bootstrap-rhel8.sh
-bash bootstrap-rhel8.sh
-```
-
-The script will install all required tools, generate your SSH key if it does
-not already exist, and print a summary. Proceed to Step 2 after it completes.
-
----
-
-## Step 2 — Run the Bootstrap Script
+## Step 1 — Run the Bootstrap Script
 
 ```bash
 chmod +x scripts/bootstrap-rhel8.sh
@@ -80,84 +65,74 @@ The script installs the following, skipping anything already present:
 | Tool        | Version installed   | Purpose                        |
 |-------------|---------------------|--------------------------------|
 | git         | latest via dnf      | Source control                 |
-| unzip/jq    | latest via dnf      | Utilities                      |
+| unzip/jq    | latest via dnf      | Utilities (jq required by cluster-start.sh) |
 | AWS CLI v2  | latest              | AWS API access                 |
 | Terraform   | 1.7.5               | Infrastructure provisioning    |
 | kubectl     | v1.26.15            | Kubernetes cluster access      |
-| Helm        | 3 (latest)          | Application chart deployments  |
 
 It also generates an Ed25519 SSH key at `~/.ssh/rke2_id_ed25519` if one does
 not already exist, starts the `ssh-agent`, and loads the key.
 
-At the end of the script, your public key is printed to the terminal. Copy it —
+At the end of the script your public key is printed to the terminal. Copy it —
 you will need it in the next step.
 
 ---
 
-## Step 3 — Add Your Public Key to GitLab
-
-The public key printed by the bootstrap script must be added to GitLab so you
-can clone the repo over SSH. If you missed it, print it again:
+## Step 2 — Add Your Public Key to GitLab
 
 ```bash
 cat ~/.ssh/rke2_id_ed25519.pub
 ```
 
 1. Log into GitLab
-2. Click your **avatar (top right) → Preferences → SSH Keys**
-3. Click **Add new key**
-4. Paste the full public key line (starts with `ssh-ed25519 ...`)
-5. Title: `rke2-rhel8-workspace`
-6. Click **Add key**
+2. Click your **avatar → Preferences → SSH Keys → Add new key**
+3. Paste the full public key line (starts with `ssh-ed25519 ...`)
+4. Title: `rke2-rhel8-workspace`
+5. Click **Add key**
 
 Test the connection:
 
 ```bash
 ssh -T git@gitlab.com
-# First time: type "yes" to accept the host fingerprint
-# Expected: "Welcome to GitLab, @yourusername!"
 ```
 
 ---
 
-## Step 4 — Configure AWS Credentials
+## Step 3 — Configure AWS Credentials
 
 ```bash
 aws configure
 # AWS Access Key ID:     <your-access-key>
 # AWS Secret Access Key: <your-secret-key>
-# Default region name:   us-east-1
+# Default region name:   us-west-2
 # Default output format: json
 
 # Verify
 aws sts get-caller-identity
 ```
 
-> **Workspace IAM role**: If your RHEL 8 workspace has an IAM instance profile
-> attached, you can skip `aws configure` entirely — the AWS CLI will pick up
-> credentials from the instance metadata automatically. Verify with
-> `aws sts get-caller-identity` without configuring anything.
+> If your RHEL 8 workspace has an IAM instance profile attached, skip
+> `aws configure` — the AWS CLI picks up credentials from instance metadata
+> automatically.
 
 ---
 
-## Step 5 — Clone the Repo
+## Step 4 — Clone the Repo
 
 ```bash
 git clone git@gitlab.com:YOUR_NAMESPACE/rke2-aws-infra.git
 cd rke2-aws-infra
 ```
 
-Replace `YOUR_NAMESPACE/rke2-aws-infra` with your actual GitLab project path
-(found on the GitLab project page under **Clone → Clone with SSH**).
-
 ---
 
-## Step 6 — Subscribe to the CIS Ubuntu 24.04 AMI
+## Step 5 — Subscribe to the CIS Ubuntu 24.04 AMI
 
-Before Terraform can use the AMI, your AWS account must be subscribed to it:
+Before Terraform can launch instances from this AMI, your AWS account must
+be subscribed:
 
 1. Visit: https://aws.amazon.com/marketplace/pp/prodview-6l5e56nst6r3g
-2. Click **Continue to Subscribe** → **Accept Terms**
+2. Click **Continue to Subscribe → Accept Terms**
 3. Wait ~1-2 minutes for activation
 
 Then find the AMI ID for your region:
@@ -168,7 +143,7 @@ aws ec2 describe-images \
   --filters "Name=name,Values=*CIS*Ubuntu*24.04*Level 1*" \
   --query "sort_by(Images, &CreationDate)[-1].{ID:ImageId,Name:Name}" \
   --output table \
-  --region us-east-1
+  --region us-west-2
 ```
 
 Note the `ImageId` (format: `ami-XXXXXXXXXXXXXXXXX`).
@@ -176,55 +151,99 @@ Note the `ImageId` (format: `ami-XXXXXXXXXXXXXXXXX`).
 > **Compatibility note**: RKE2 v1.26 was built against older kernels. Ubuntu
 > 24.04 ships kernel 6.8. The `pre_userdata` scripts include the necessary
 > kernel module loading and sysctl tuning to maximise compatibility. Validate
-> in a non-production environment first. Ubuntu 22.04 CIS (kernel 5.15) is a
-> safer kernel pairing if containerd issues arise.
+> in a non-production environment first.
 
 ---
 
-## Step 7 — Configure terraform.tfvars
+## Step 6 — Deploy the Bootstrap (Run Once)
+
+The bootstrap creates the S3 bucket and DynamoDB table used as the Terraform
+remote backend for the prod environment, plus a KMS key to encrypt them.
+
+```bash
+cd environments/bootstrap
+terraform init
+terraform apply
+```
+
+Note the outputs — you will need `bucket_name` in the next step:
+
+```
+bucket_name         = "rke2-prod-tfstate-641275310402"
+dynamodb_table_name = "rke2-prod-tfstate-lock"
+kms_key_arn         = "arn:aws:kms:us-west-2:..."
+aws_region          = "us-west-2"
+```
+
+Bootstrap state is stored at `~/.terraform-bootstrap/rke2-prod.tfstate`. This
+file must be preserved — if it is lost, Terraform will try to recreate resources
+that already exist and fail with `AlreadyExists` errors. Back it up if needed:
+
+```bash
+cp ~/.terraform-bootstrap/rke2-prod.tfstate \
+   ~/.terraform-bootstrap/rke2-prod.tfstate.bak
+```
+
+> **Never run `terraform destroy` in the bootstrap directory** unless you
+> intend to permanently delete all cluster state and artifacts.
+
+---
+
+## Step 7 — Configure the Prod Backend
+
+Open `environments/prod/main.tf` and update the backend block with the
+`bucket_name` output from Step 6:
+
+```hcl
+backend "s3" {
+  bucket         = "rke2-prod-tfstate-641275310402"   # from bootstrap output
+  key            = "state/terraform.tfstate"
+  region         = "us-west-2"
+  dynamodb_table = "rke2-prod-tfstate-lock"
+  encrypt        = true
+}
+```
+
+---
+
+## Step 8 — Configure terraform.tfvars
 
 ```bash
 vi environments/prod/terraform.tfvars
 ```
 
-Set the following values at minimum:
+Set at minimum:
 
 ```hcl
-aws_region   = "us-east-1"           # Your AWS region
-cluster_name = "rke2-prod"           # Max 24 characters
+aws_region   = "us-west-2"
+cluster_name = "rke2-prod"       # max 24 characters
 environment  = "prod"
 
-ami_id              = "ami-XXXXXXXXXXXX"           # From Step 6
-ssh_public_key_path = "~/.ssh/rke2_id_ed25519.pub" # Generated in Step 2
+ami_id              = "ami-XXXXXXXXXXXX"            # from Step 5
+ssh_public_key_path = "~/.ssh/rke2_id_ed25519.pub"  # generated in Step 1
 
 control_plane_instance_type = "c5.2xlarge"
 worker_instance_type        = "t3.xlarge"
-worker_spot                 = true   # Spot workers — ~60-70% cost saving
+worker_spot                 = true    # spot workers — ~60-70% cost saving
 
-rke2_version = "v1.26.15+rke2r1"   # EOL — plan upgrade to v1.28+ after deploy
+rke2_version = "v1.26.15+rke2r1"    # EOL — plan upgrade to v1.28+ after deploy
+
+pod_cidr     = "10.42.0.0/16"
+service_cidr = "10.96.0.0/12"
 ```
+
+> **`terraform.tfvars` is gitignored** — never commit it to the repo.
 
 ---
 
-## Step 8 — Restrict the Bastion SSH Source CIDR
-
-Open `modules/securitygroups/main.tf` and replace `0.0.0.0/0` in the bastion
-ingress rule with the public IP of your RHEL 8 workspace. This locks SSH access
-to the bastion down to your workspace only:
+## Step 9 — Restrict the Bastion SSH Source CIDR
 
 ```bash
 # Find your workspace's public egress IP
 curl -s https://api.ipify.org
-# e.g. 203.0.113.42
 ```
 
-Then edit the file:
-
-```bash
-vi modules/securitygroups/main.tf
-```
-
-Find and update this block:
+Edit `modules/securitygroups/main.tf` and replace `0.0.0.0/0` with your IP:
 
 ```hcl
 ingress {
@@ -236,51 +255,46 @@ ingress {
 }
 ```
 
-> If your workspace is assigned a dynamic IP, use your organisation's egress
-> NAT IP range instead of a single `/32`. Never leave this as `0.0.0.0/0`
-> in production.
+> Never leave this as `0.0.0.0/0` in production.
 
 ---
 
-## Step 9 — Initialise Terraform
+## Step 10 — Initialise Terraform
 
 ```bash
 cd environments/prod
 terraform init
 ```
 
-This downloads the AWS, random, cloudinit, tls, and local providers, and fetches
-the `rancherfederal/rke2-aws-tf` module from GitHub (pinned to `v2.5.1`).
+When prompted whether to copy existing state to the new backend, type `yes`.
 
 Expected output ends with: `Terraform has been successfully initialized!`
 
 ---
 
-## Step 10 — Plan and Review
+## Step 11 — Plan and Review
 
 ```bash
 terraform plan -out=tfplan
 ```
 
-Read through the plan output before applying. You should see resources being
-created for: VPC, subnets, IGW, NAT gateway, EIPs, security groups, SSH key
-pair, bastion EC2, RKE2 server ASG, worker ASG, internal control plane NLB,
-and the application-facing NLB.
-
-Nothing is changed in AWS until you run `apply`.
+Read through the plan before applying. You should see resources being created
+for: VPC, subnets, IGW, NAT gateway, EIPs, security groups, SSH key pair,
+KMS key and alias for EBS, bastion EC2, RKE2 server ASG, worker ASG, internal
+control plane NLB, and the application-facing NLB.
 
 ---
 
-## Step 11 — Deploy Everything
+## Step 12 — Deploy Everything
 
 ```bash
 terraform apply tfplan
 ```
 
-This deploys the complete stack in one shot — VPC, networking, bastion, and
-the full RKE2 cluster. Expect **10-15 minutes** for the cluster bootstrap to
-complete. The RKE2 control plane must initialise and upload the join token to
-S3 before the worker ASG can boot and join.
+This deploys the complete stack in one shot. Expect **10-20 minutes** for the
+cluster bootstrap to complete. The RKE2 control plane must initialise and upload
+the join token to S3 before the worker ASG can boot and join. The CIS hardened
+AMI takes longer to bootstrap than a standard image.
 
 After apply, review all outputs:
 
@@ -289,19 +303,24 @@ terraform output
 ```
 
 Key values:
-- `bastion_public_ip` — SSH jump host (EIP, stable)
-- `control_plane_lb_dns` — internal NLB for the Kubernetes API (private only)
-- `app_nlb_public_ip` — public EIP for application traffic; point DNS here
-- `kubeconfig_s3_path` — S3 path to the generated kubeconfig
+
+| Output | Description |
+|--------|-------------|
+| `bastion_public_ip` | SSH jump host (EIP, stable) |
+| `control_plane_lb_dns` | Internal NLB for the Kubernetes API (private only) |
+| `app_nlb_public_ip` | Public EIP for application traffic — point DNS here |
+| `kubeconfig_s3_path` | S3 path to the cluster kubeconfig |
+| `ssh_public_key_s3_path` | S3 path to the SSH public key |
+| `ssh_private_key_s3_path` | S3 path to the SSH private key (KMS encrypted) |
+| `ebs_kms_key_arn` | ARN of the KMS key encrypting all cluster EBS volumes |
 
 ---
 
-## Step 12 — Fetch kubeconfig and Verify the Cluster
+## Step 13 — Fetch kubeconfig and Verify the Cluster
 
 ```bash
-KUBECONFIG_PATH=$(terraform output -raw kubeconfig_s3_path)
 mkdir -p ~/.kube
-aws s3 cp "${KUBECONFIG_PATH}" ~/.kube/config
+aws s3 cp s3://rke2-prod-tfstate-641275310402/kubeconfig/config ~/.kube/config
 chmod 600 ~/.kube/config
 
 # Verify all 5 nodes are Ready (1 control plane + 4 workers)
@@ -319,14 +338,12 @@ ip-10-0-2-CCC.ec2.internal    Ready    <none>                      4m    v1.26.1
 ip-10-0-2-DDD.ec2.internal    Ready    <none>                      4m    v1.26.15+rke2r1
 ```
 
-If nodes are not Ready after 15 minutes, see the Troubleshooting section below.
-
 ---
 
-## Step 13 — SSH Into Cluster Nodes (via Bastion)
+## Step 14 — SSH Into Cluster Nodes (via Bastion)
 
 The control plane and workers are in private subnets — reach them by hopping
-through the bastion. The ssh-agent loaded your key in Step 2, so agent
+through the bastion. The ssh-agent loaded your key in Step 1 so agent
 forwarding works automatically.
 
 ```bash
@@ -347,35 +364,7 @@ ssh ubuntu@10.0.1.X
 ssh ubuntu@10.0.2.X
 ```
 
-The SSH user on every node is **`ubuntu`** — see the note on SSH users in
-the README.
-
----
-
-## Step 14 — Deploy Helm Charts
-
-Run from your workspace (kubectl is already configured via Step 12):
-
-```bash
-cd ~/rke2-aws-infra
-
-# Set your email for Let's Encrypt certificate issuers
-export ACME_EMAIL="your@email.com"
-
-chmod +x helm/deploy.sh
-bash helm/deploy.sh
-```
-
-This deploys in order: cert-manager → ingress-nginx → CoreDNS patch →
-Let's Encrypt ClusterIssuers.
-
-Verify:
-
-```bash
-kubectl get pods -n cert-manager
-kubectl get pods -n ingress-nginx
-kubectl get nodes
-```
+The SSH user on all nodes is **`ubuntu`**.
 
 ---
 
@@ -385,55 +374,110 @@ kubectl get nodes
 terraform output app_nlb_public_ip
 ```
 
-Point your domain's DNS A record (or Route 53 record) to this IP, then follow
-[coredns-guide.md](./coredns-guide.md) for the full Ingress and TLS walkthrough.
+Point your domain's DNS A record to this IP.
 
 ---
 
-## Day-2 Operations — Applying Changes
+## Day-2 Operations
 
-When you update Terraform or Helm files:
+### Viewing Terraform Outputs
+
+At any time from `environments/prod`:
 
 ```bash
-cd ~/rke2-aws-infra
+terraform output          # all outputs
+terraform output -json    # JSON format
+terraform output bastion_public_ip   # single value
+```
 
-# Pull latest from GitLab
-git pull origin main
+### Applying Changes
 
-# Navigate to the prod environment
+```bash
 cd environments/prod
-
-# Review changes
+git pull origin main
 terraform plan -out=tfplan
-
-# Apply
 terraform apply tfplan
 ```
 
-For Helm chart updates:
+### Stopping and Starting the Cluster
+
+To save cost when the cluster is not in use, use the provided scripts. Because
+the cluster mixes on-demand and spot instances, each instance type requires
+different handling — a simple "stop all" approach does not work.
+
+#### Why spot instances require special handling
+
+AWS does not allow one-time spot instances to be stopped via the EC2 stop API —
+attempting to do so returns an `UnsupportedOperation` error. Additionally,
+simply setting ASG desired capacity to 0 is not enough on its own because if
+the ASG has any processes suspended (from a previous run), it cannot act on
+the capacity change and instances will remain running indefinitely.
+
+The stop script handles workers by:
+
+1. **Resuming all ASG processes** — clears any previously suspended state so
+   the ASG can act
+2. **Scaling the ASG to 0** — prevents the ASG from launching replacement
+   instances during termination
+3. **Cancelling spot requests directly** — cancels the underlying one-time
+   spot instance requests via the EC2 API, which unblocks termination
+4. **Terminating instances directly** — explicitly terminates the instances
+   rather than waiting for the ASG, then waits for full termination before
+   proceeding
+
+#### Why the control plane is handled differently
+
+The control plane runs on an on-demand instance and its EBS root volume holds
+all etcd data, cluster certificates, and RKE2 configuration. Terminating it
+would destroy all cluster state. Instead, the stop script:
+
+1. **Suspends ASG health checks** — prevents the ASG from detecting the
+   stopped instance as unhealthy and replacing it with a fresh one
+2. **Stops the instance via the EC2 API** — the EBS volume remains attached
+   and intact, preserving all cluster state
+
+On start, the same instance is restarted and ASG processes are resumed. RKE2's
+systemd service starts automatically and the cluster comes back up with full
+etcd state — the same workloads, certificates, and configuration as before.
+
+#### Ghost node cleanup
+
+When spot workers are terminated and new ones launch, the old node objects
+remain in the Kubernetes API server with `NotReady` status because nothing
+removes them automatically. The new workers register under new node names,
+leaving stale ghost entries behind. The start script waits for the expected
+number of new workers to reach `Ready` state, then deletes all `NotReady`
+node objects, leaving a clean cluster.
 
 ```bash
-bash helm/deploy.sh
-# deploy.sh uses --upgrade --install so it is safe to re-run at any time
+# Stop — suspends CP ASG, stops CP instance, cancels spot requests,
+#         terminates workers, stops bastion
+bash scripts/cluster-stop.sh
+
+# Start — starts bastion and CP instance, resumes CP ASG, restores
+#          worker ASG, waits for nodes to be Ready, removes ghost nodes,
+#          fetches fresh kubeconfig
+bash scripts/cluster-start.sh
 ```
 
----
+State between stop and start is saved to `~/.rke2-cluster-state/`.
 
-## Keeping the SSH Agent Alive Across Sessions
+> **Note**: `jq` must be installed for `cluster-start.sh` to parse saved state.
+> It is installed by `bootstrap-rhel8.sh` automatically.
+
+### Keeping the SSH Agent Alive
 
 The `ssh-agent` started by the bootstrap script lives only for that shell
-session. If you disconnect and reconnect to the workspace, reload the key:
+session. If you reconnect to the workspace, reload the key:
 
 ```bash
 eval "$(ssh-agent -s)"
 ssh-add ~/.ssh/rke2_id_ed25519
-ssh-add -l   # confirm key is loaded
 ```
 
-To make this automatic on login, add these lines to `~/.bashrc`:
+To make this automatic on login, add to `~/.bashrc`:
 
 ```bash
-# Auto-start ssh-agent and load rke2 key
 if ! pgrep -u "$USER" ssh-agent > /dev/null; then
   eval "$(ssh-agent -s)"
 fi
@@ -442,7 +486,21 @@ if [ -f "$HOME/.ssh/rke2_id_ed25519" ]; then
 fi
 ```
 
-Then reload: `source ~/.bashrc`
+Then: `source ~/.bashrc`
+
+---
+
+## Destroy
+
+```bash
+# Destroy all cluster infrastructure (leaves bootstrap bucket intact)
+cd environments/prod
+terraform destroy
+```
+
+The S3 bucket, DynamoDB table, and bootstrap KMS key are **not** destroyed by
+this — they are managed by `environments/bootstrap/` and intentionally
+preserved.
 
 ---
 
@@ -450,25 +508,29 @@ Then reload: `source ~/.bashrc`
 
 | Symptom | Likely Cause | Fix |
 |---|---|---|
-| `terraform init` fails with module download error | No outbound internet from workspace | Check proxy settings; confirm github.com is reachable |
-| `aws configure` credentials rejected | Wrong keys or wrong region | Re-run `aws configure`; confirm with `aws sts get-caller-identity` |
-| Nodes stuck in `NotReady` after 15 min | Canal/VXLAN blocked or RKE2 bootstrap failed | SSH to control plane via bastion; check `sudo journalctl -u rke2-server -f` |
+| `terraform init` fails — bucket does not exist | Bootstrap not run yet | Run `terraform apply` in `environments/bootstrap/` first |
+| `AlreadyExists` on KMS alias during apply | Orphaned alias from previous failed destroy | Run `aws kms delete-alias --alias-name alias/rke2-prod-ebs --region us-west-2` then re-apply |
+| `AlreadyExists` on KMS alias during bootstrap apply | Bootstrap state lost | Run `terraform import aws_kms_alias.state alias/rke2-prod-tfstate` then re-apply |
+| Nodes stuck in `NotReady` after 20 min | Canal/VXLAN blocked or RKE2 bootstrap failed | SSH to control plane via bastion; check `sudo journalctl -u rke2-server -f` |
 | Worker nodes not joining | S3 token fetch failed or IAM policy missing | Check worker userdata logs: `sudo cat /var/log/cloud-init-output.log` |
-| `kubectl` connection refused | kubeconfig server URL mismatch | Confirm `~/.kube/config` server points to the internal NLB DNS, not localhost |
-| SSH to bastion fails | Bastion SG source CIDR doesn't match workspace IP | Update `modules/securitygroups/main.tf` CIDR and run `terraform apply` |
+| `AccessDenied` on S3 kubeconfig download from bastion | Bastion role missing KMS decrypt permission | Run `terraform apply -target=aws_iam_role_policy.bastion` |
+| Ghost nodes in `NotReady` after cluster start | Old node objects from terminated spot instances | Run `kubectl get nodes --no-headers \| awk '$2=="NotReady" {print $1}' \| xargs kubectl delete node` or use `cluster-start.sh` which does this automatically |
+| Spot workers not terminating after `cluster-stop.sh` | ASG processes suspended or spot requests not cancelled | Resume ASG processes and cancel spot requests — see cluster-stop.sh comments |
+| `kubectl` connection refused | kubeconfig stale after cluster restart | Re-fetch: `aws s3 cp s3://<bucket>/kubeconfig/config ~/.kube/config` |
+| SSH to bastion fails | Bastion SG CIDR doesn't match workspace IP | Update `modules/securitygroups/main.tf` CIDR and run `terraform apply` |
 | Spot worker interrupted, pod lost | Expected spot behaviour | Ensure app `replicas >= 2` and PodDisruptionBudget is set |
 
 ---
 
-## ⚠️ Known Deviations from Defaults / Best Practice Notes
+## ⚠️ Known Deviations and Best Practice Notes
 
-| Item | Your Config | Industry Standard | Notes |
-|------|-------------|-------------------|-------|
+| Item | Current Config | Industry Standard | Notes |
+|------|----------------|-------------------|-------|
 | Control plane count | 1 | 3 (etcd HA quorum) | Single CP is a SPOF. Set `control_plane_count = 3` for production. |
-| RKE2 version | v1.26.15 | v1.28+ or v1.29+ | v1.26 is EOL. Plan upgrade. |
-| Ubuntu version | 24.04 + RKE2 1.26 | Ubuntu 22.04 + RKE2 1.26 | Kernel 6.8 is newer than RKE2 1.26 test matrix; validate carefully. |
-| Bastion SSH CIDR | Workspace IP/32 | Org egress CIDR | Confirm locked down before deploying. |
-| Worker instances | Spot | On-Demand | Set `worker_spot = false` in tfvars to revert if workloads need guaranteed capacity. |
+| RKE2 version | v1.26.15 | v1.28+ | v1.26 is EOL. Plan upgrade after initial deploy. |
+| Ubuntu version | 24.04 + RKE2 1.26 | Ubuntu 22.04 + RKE2 1.26 | Kernel 6.8 is newer than RKE2 1.26 test matrix. Validate carefully. |
+| Worker instances | Spot | On-Demand | Set `worker_spot = false` if workloads require guaranteed capacity. |
+| Single AZ | Yes | Multi-AZ | All resources in one AZ. An AZ outage takes down the cluster. |
 
 ---
 
@@ -487,18 +549,4 @@ terraform apply tfplan
 
 # 4. Validate
 kubectl get nodes
-```
-
----
-
-## Destroy
-
-```bash
-# Remove Helm releases first to avoid orphaned AWS load balancer resources
-helm uninstall ingress-nginx -n ingress-nginx
-helm uninstall cert-manager -n cert-manager
-
-# Destroy all Terraform-managed infrastructure
-cd environments/prod
-terraform destroy
 ```

@@ -6,21 +6,36 @@
 # S3 bucket and DynamoDB table that prod uses as its remote
 # backend, plus a dedicated KMS key to encrypt them.
 #
-# Because this root has its own local state it is completely
-# independent of the prod root — terraform destroy in prod
-# will never touch these resources.
+# Because this root has its own persistent local state it is
+# completely independent of the prod root — terraform destroy
+# in prod will never touch these resources.
 #
-# Usage:
-#   cd environments/prod/bootstrap
+# The state file is stored outside the project directory so
+# it survives git operations, directory changes, and accidental
+# deletion of the project folder.
+#
+# Usage (first time):
+#   cd environments/bootstrap
 #   terraform init
 #   terraform apply
 #
-# After apply, copy the outputs into the backend block of
-# environments/prod/main.tf and run terraform init there.
+# After apply, copy the bucket_name output into the backend
+# block of environments/prod/main.tf and run terraform init.
 # ============================================================
 
 terraform {
   required_version = ">= 1.3"
+
+  # ============================================================
+  # Persistent local backend
+  # Stores bootstrap state in the home directory so it is never
+  # lost between sessions, git cleans, or directory moves.
+  # This is what prevents the KMS alias AlreadyExists error —
+  # Terraform always knows what bootstrap has already created.
+  # ============================================================
+  backend "local" {
+    path = "/home/rhel-admin/.terraform-bootstrap/rke2-prod.tfstate"
+  }
 
   required_providers {
     aws = {

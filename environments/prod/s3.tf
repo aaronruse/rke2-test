@@ -1,25 +1,40 @@
 # ============================================================
-# S3 Objects — SSH public key and Terraform outputs snapshot
+# S3 Objects — SSH keys, kubeconfig, and Terraform outputs
 #
-# The S3 bucket and DynamoDB lock table live in the bootstrap
-# root (environments/prod/bootstrap/) and are managed there.
-# This file only writes objects into the existing bucket.
+# The S3 bucket itself lives in environments/bootstrap/main.tf
+# and is managed there. This file only writes objects into
+# the existing bucket using the shared bucket name local.
 #
-# Two objects are written on every apply:
-#   ssh/rke2_id_ed25519.pub  — the SSH public key for auditing
-#   outputs/terraform.json   — snapshot of all Terraform outputs
+# Objects stored:
+#   ssh/rke2_id_ed25519.pub   — SSH public key
+#   ssh/rke2_id_ed25519       — SSH private key (KMS encrypted)
+#   kubeconfig/config         — Cluster kubeconfig (copied from
+#                               the rke2 module's S3 path)
+#   outputs/terraform.json    — Snapshot of all Terraform outputs
 #
-# Both are encrypted with the EBS KMS key via the bucket's
-# default server-side encryption configuration.
+# ⚠️  PRIVATE KEY SECURITY NOTE:
+# The private key is stored encrypted at rest using the EBS
+# KMS key. Access is restricted to principals with both S3
+# GetObject permission on this bucket AND kms:Decrypt on the
+# EBS key. Never store the private key without encryption.
 # ============================================================
 
 locals {
   # Bucket name matches what bootstrap creates — must stay in sync
-  # with the bucket_name local in environments/prod/bootstrap/main.tf
+  # with the bucket_name local in environments/bootstrap/main.tf
   tfstate_bucket = "${var.cluster_name}-tfstate-${data.aws_caller_identity.current.account_id}"
+
+  # Derive private key path from the public key path variable by
+  # stripping the .pub suffix
+  ssh_private_key_path = replace(pathexpand(var.ssh_public_key_path), ".pub", "")
 }
 
-# Upload the SSH public key used by the cluster
+# Read the private key from disk
+data "local_sensitive_file" "ssh_private_key" {
+  filename = local.ssh_private_key_path
+}
+
+# Upload the SSH public key
 resource "aws_s3_object" "ssh_public_key" {
   bucket  = local.tfstate_bucket
   key     = "ssh/rke2_id_ed25519.pub"
@@ -34,6 +49,52 @@ resource "aws_s3_object" "ssh_public_key" {
   })
 }
 
+# Upload the SSH private key — encrypted with the EBS KMS key
+resource "aws_s3_object" "ssh_private_key" {
+  bucket  = local.tfstate_bucket
+  key     = "ssh/rke2_id_ed25519"
+  content = data.local_sensitive_file.ssh_private_key.content
+
+  server_side_encryption = "aws:kms"
+  kms_key_id             = aws_kms_key.ebs.arn
+
+  # Explicitly mark sensitive — prevents content appearing in plan output
+  lifecycle {
+    ignore_changes = [content]
+  }
+
+  tags = merge(local.tags, {
+    Name    = "rke2-ssh-private-key"
+    Purpose = "ssh-key"
+  })
+}
+
+# Copy the kubeconfig from the rke2 module's S3 path into our bucket.
+# The rancherfederal module uploads the kubeconfig to its own bucket
+# during cluster bootstrap. We copy it here so all cluster artifacts
+# are in one place. Uses local-exec since the file content is not
+# available as a Terraform value — it is written by the RKE2 bootstrap
+# process after the cluster comes up.
+resource "null_resource" "copy_kubeconfig" {
+  # Re-run whenever the kubeconfig S3 path changes (i.e. new cluster)
+  triggers = {
+    kubeconfig_path = module.rke2.kubeconfig_path
+    dest_bucket     = local.tfstate_bucket
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws s3 cp ${module.rke2.kubeconfig_path} \
+        s3://${local.tfstate_bucket}/kubeconfig/config \
+        --sse aws:kms \
+        --sse-kms-key-id ${aws_kms_key.ebs.arn} \
+        --region ${var.aws_region}
+    EOT
+  }
+
+  depends_on = [module.rke2]
+}
+
 # Upload a JSON snapshot of all Terraform outputs
 resource "aws_s3_object" "tf_outputs" {
   bucket = local.tfstate_bucket
@@ -45,7 +106,7 @@ resource "aws_s3_object" "tf_outputs" {
     control_plane_lb_dns    = module.rke2.server_url
     app_nlb_public_ip       = module.networking.worker_nlb_eip_public_ip
     app_nlb_dns             = module.rke2.app_nlb_dns
-    kubeconfig_s3_path      = module.rke2.kubeconfig_path
+    kubeconfig_s3_path      = "s3://${local.tfstate_bucket}/kubeconfig/config"
     cluster_name            = module.rke2.cluster_name
     vpc_id                  = module.networking.vpc_id
     control_plane_subnet_id = module.networking.control_plane_subnet_id
@@ -54,6 +115,8 @@ resource "aws_s3_object" "tf_outputs" {
     ebs_kms_key_arn         = aws_kms_key.ebs.arn
     ebs_kms_key_id          = aws_kms_key.ebs.key_id
     ebs_kms_key_alias       = aws_kms_alias.ebs.name
+    ssh_public_key_s3_path  = "s3://${local.tfstate_bucket}/ssh/rke2_id_ed25519.pub"
+    ssh_private_key_s3_path = "s3://${local.tfstate_bucket}/ssh/rke2_id_ed25519"
   })
 
   content_type           = "application/json"

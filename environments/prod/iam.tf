@@ -1,7 +1,7 @@
 # ============================================================
 # IAM: Bastion Instance Profile
 # Grants the bastion all permissions needed to manage an RKE2
-# cluster — EC2, ASG, S3, ELB, SSM, EKS read, CloudWatch logs.
+# cluster — EC2, ASG, S3, ELB, SSM, CloudWatch, Route53.
 # ============================================================
 data "aws_iam_policy_document" "bastion_assume_role" {
   statement {
@@ -21,7 +21,22 @@ resource "aws_iam_role" "bastion" {
 }
 
 data "aws_iam_policy_document" "bastion" {
-  # ---- S3: kubeconfig + RKE2 bootstrap artifacts ----
+
+  # ---- S3: list all buckets ----
+  # s3:ListAllMyBuckets is an account-level action and MUST use
+  # resource "*" — scoping it to a bucket ARN causes AccessDenied.
+  statement {
+    sid    = "S3ListAllBuckets"
+    effect = "Allow"
+    actions = [
+      "s3:ListAllMyBuckets",
+    ]
+    resources = ["*"]
+  }
+
+  # ---- S3: RKE2 bootstrap artifacts (kubeconfig, token) ----
+  # The rancherfederal module writes to a bucket prefixed with
+  # the cluster name. Scoped tightly to that prefix.
   statement {
     sid    = "S3RKE2Artifacts"
     effect = "Allow"
@@ -30,7 +45,6 @@ data "aws_iam_policy_document" "bastion" {
       "s3:PutObject",
       "s3:DeleteObject",
       "s3:ListBucket",
-      "s3:ListAllMyBuckets",
       "s3:GetBucketLocation",
     ]
     resources = [
@@ -39,26 +53,47 @@ data "aws_iam_policy_document" "bastion" {
     ]
   }
 
-  # ---- S3: Terraform state bucket read access ----
-  # The bucket is managed by the bootstrap root so we reference
-  # it by its known name rather than a resource attribute.
+  # ---- S3: tfstate bucket — SSH keys, kubeconfig, outputs ----
+  # The bootstrap bucket is not prefixed with cluster_name alone
+  # so it needs its own statement scoped to the full bucket name.
   statement {
-    sid    = "S3TFStateRead"
+    sid    = "S3TFStateBucket"
     effect = "Allow"
     actions = [
       "s3:GetObject",
+      "s3:PutObject",
       "s3:ListBucket",
       "s3:GetBucketLocation",
     ]
     resources = [
-      "arn:aws:s3:::${local.tfstate_bucket}",
-      "arn:aws:s3:::${local.tfstate_bucket}/*",
+      "arn:aws:s3:::${var.cluster_name}-tfstate-${data.aws_caller_identity.current.account_id}",
+      "arn:aws:s3:::${var.cluster_name}-tfstate-${data.aws_caller_identity.current.account_id}/*",
     ]
   }
 
-  # ---- DynamoDB: Terraform state lock table read access ----
-  # Allows the bastion to inspect lock state for debugging
-  # stuck or abandoned Terraform locks.
+  # ---- KMS: decrypt objects from both cluster buckets ----
+  # The tfstate bucket is encrypted with the bootstrap KMS key
+  # (managed in bootstrap/main.tf). The rke2 artifacts bucket
+  # uses the EBS KMS key. The bastion needs Decrypt on both to
+  # read the kubeconfig, SSH keys, and outputs from S3.
+  statement {
+    sid    = "KMSDecryptBucketObjects"
+    effect = "Allow"
+    actions = [
+      "kms:Decrypt",
+      "kms:GenerateDataKey",
+      "kms:DescribeKey",
+    ]
+    resources = [
+      # EBS/cluster KMS key — encrypts rke2 artifacts and cluster EBS
+      aws_kms_key.ebs.arn,
+      # Bootstrap state KMS key — encrypts tfstate bucket objects
+      # Referenced by ARN pattern since it lives in bootstrap state
+      "arn:aws:kms:${var.aws_region}:${data.aws_caller_identity.current.account_id}:key/*",
+    ]
+  }
+
+  # ---- DynamoDB: Terraform state lock table read ----
   statement {
     sid    = "DynamoDBTFStateLockRead"
     effect = "Allow"
@@ -76,7 +111,6 @@ data "aws_iam_policy_document" "bastion" {
     sid    = "EC2ReadWrite"
     effect = "Allow"
     actions = [
-      # Read
       "ec2:DescribeInstances",
       "ec2:DescribeInstanceStatus",
       "ec2:DescribeInstanceTypes",
@@ -96,18 +130,17 @@ data "aws_iam_policy_document" "bastion" {
       "ec2:DescribeNatGateways",
       "ec2:DescribeRouteTables",
       "ec2:DescribeAddresses",
-      # Instance management
+      "ec2:DescribeSpotInstanceRequests",
       "ec2:StartInstances",
       "ec2:StopInstances",
       "ec2:RebootInstances",
       "ec2:TerminateInstances",
-      # Volume management
+      "ec2:CancelSpotInstanceRequests",
       "ec2:AttachVolume",
       "ec2:DetachVolume",
       "ec2:CreateVolume",
       "ec2:DeleteVolume",
       "ec2:ModifyVolume",
-      # Tagging
       "ec2:CreateTags",
       "ec2:DeleteTags",
     ]
@@ -128,6 +161,8 @@ data "aws_iam_policy_document" "bastion" {
       "autoscaling:SetDesiredCapacity",
       "autoscaling:TerminateInstanceInAutoScalingGroup",
       "autoscaling:UpdateAutoScalingGroup",
+      "autoscaling:SuspendProcesses",
+      "autoscaling:ResumeProcesses",
       "autoscaling:EnterStandby",
       "autoscaling:ExitStandby",
     ]
@@ -209,7 +244,7 @@ data "aws_iam_policy_document" "bastion" {
     resources = ["*"]
   }
 
-  # ---- Route53: useful for DNS-based ingress troubleshooting ----
+  # ---- Route53: DNS-based ingress troubleshooting ----
   statement {
     sid    = "Route53ReadOnly"
     effect = "Allow"
@@ -222,13 +257,11 @@ data "aws_iam_policy_document" "bastion" {
     resources = ["*"]
   }
 
-  # ---- STS: allow assuming other roles if needed ----
+  # ---- STS ----
   statement {
-    sid    = "STSGetCallerIdentity"
-    effect = "Allow"
-    actions = [
-      "sts:GetCallerIdentity",
-    ]
+    sid     = "STSGetCallerIdentity"
+    effect  = "Allow"
+    actions = ["sts:GetCallerIdentity"]
     resources = ["*"]
   }
 }
@@ -253,19 +286,15 @@ resource "aws_iam_instance_profile" "bastion" {
 
 # ============================================================
 # KMS: EBS Volume Encryption Key
-# A customer-managed KMS key is used for all cluster EBS
-# volumes so that key policy, rotation, and ARN are fully
-# visible and auditable in Terraform state.
+# Managed here so it is destroyed cleanly with the prod root,
+# preventing AlreadyExists errors on destroy/recreate cycles.
 #
-# The key policy has four statements:
+# Key policy statements:
 #   1. Root account — prevents lock-out, allows IAM delegation
-#   2. AutoScaling encryption — lets the service-linked role
-#      create and attach encrypted volumes when launching ASG
-#      instances. Without this the instances fail to start.
-#   3. AutoScaling CreateGrant — allows the service to grant
-#      volume access to instances (restricted to AWS resources).
-#   4. Key administrator — the IAM identity running Terraform
-#      can manage the key lifecycle.
+#   2. AutoScaling encryption — required for ASG to launch
+#      instances with encrypted EBS volumes
+#   3. AutoScaling CreateGrant — restricted to AWS resources
+#   4. Key administrator — Terraform caller identity
 # ============================================================
 data "aws_iam_policy_document" "ebs_kms" {
   statement {

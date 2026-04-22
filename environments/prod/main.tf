@@ -3,7 +3,7 @@ terraform {
 
   # ============================================================
   # Remote Backend — S3 + DynamoDB state locking
-  # Bucket and table are provisioned by environments/prod/bootstrap/
+  # Bucket and table are provisioned by environments/bootstrap/
   # ============================================================
   backend "s3" {
     bucket         = "rke2-prod-tfstate-641275310402"
@@ -33,6 +33,10 @@ terraform {
     local = {
       source  = "hashicorp/local"
       version = ">= 2.0"
+    }
+    null = {
+      source  = "hashicorp/null"
+      version = ">= 3.0"
     }
   }
 }
@@ -184,8 +188,8 @@ output "app_nlb_dns" {
 }
 
 output "kubeconfig_s3_path" {
-  description = "S3 path where the kubeconfig is stored after cluster bootstrap"
-  value       = module.rke2.kubeconfig_path
+  description = "S3 path where the kubeconfig is stored in the tfstate bucket"
+  value       = "s3://${local.tfstate_bucket}/kubeconfig/config"
 }
 
 output "cluster_name" {
@@ -230,12 +234,17 @@ output "ebs_kms_key_alias" {
 
 output "ssh_public_key_s3_path" {
   description = "S3 path of the uploaded SSH public key"
-  value       = "s3://${local.tfstate_bucket}/${aws_s3_object.ssh_public_key.key}"
+  value       = "s3://${local.tfstate_bucket}/ssh/rke2_id_ed25519.pub"
+}
+
+output "ssh_private_key_s3_path" {
+  description = "S3 path of the uploaded SSH private key (KMS encrypted)"
+  value       = "s3://${local.tfstate_bucket}/ssh/rke2_id_ed25519"
 }
 
 output "tf_outputs_s3_path" {
   description = "S3 path of the Terraform outputs JSON snapshot"
-  value       = "s3://${local.tfstate_bucket}/${aws_s3_object.tf_outputs.key}"
+  value       = "s3://${local.tfstate_bucket}/outputs/terraform.json"
 }
 
 output "ssh_connect_instructions" {
@@ -254,9 +263,9 @@ output "ssh_connect_instructions" {
     # 4. From the bastion, SSH into a worker node:
     ssh ubuntu@<worker-private-ip>
 
-    # ---- Alternatively: kubectl via kubeconfig from S3 ----
-    # From the bastion:
-    aws s3 cp ${module.rke2.kubeconfig_path} ~/.kube/config
+    # ---- Fetch kubeconfig from S3 ----
+    aws s3 cp s3://${local.tfstate_bucket}/kubeconfig/config ~/.kube/config \
+      --region ${var.aws_region}
     export KUBECONFIG=~/.kube/config
     kubectl get nodes
   INSTRUCTIONS

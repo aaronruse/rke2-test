@@ -113,13 +113,13 @@ variable "worker_spot" {
 variable "control_plane_instance_type" {
   description = "EC2 instance type for control plane nodes"
   type        = string
-  default     = "c5.2xlarge"
+  default     = "t3.xlarge"
 }
 
 variable "worker_instance_type" {
   description = "EC2 instance type for worker nodes"
   type        = string
-  default     = "t3.xlarge"
+  default     = "t3.2xlarge"
 }
 
 variable "bastion_instance_type" {

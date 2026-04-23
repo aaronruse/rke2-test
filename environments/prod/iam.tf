@@ -54,8 +54,6 @@ data "aws_iam_policy_document" "bastion" {
   }
 
   # ---- S3: tfstate bucket — SSH keys, kubeconfig, outputs ----
-  # The bootstrap bucket is not prefixed with cluster_name alone
-  # so it needs its own statement scoped to the full bucket name.
   statement {
     sid    = "S3TFStateBucket"
     effect = "Allow"
@@ -71,11 +69,10 @@ data "aws_iam_policy_document" "bastion" {
     ]
   }
 
-  # ---- KMS: decrypt objects from both cluster buckets ----
+  # ---- KMS: decrypt objects from the bootstrap state bucket ----
   # The tfstate bucket is encrypted with the bootstrap KMS key
-  # (managed in bootstrap/main.tf). The rke2 artifacts bucket
-  # uses the EBS KMS key. The bastion needs Decrypt on both to
-  # read the kubeconfig, SSH keys, and outputs from S3.
+  # (managed in bootstrap/main.tf). The bastion needs Decrypt
+  # to read the kubeconfig, SSH keys, and outputs from S3.
   statement {
     sid    = "KMSDecryptBucketObjects"
     effect = "Allow"
@@ -85,10 +82,6 @@ data "aws_iam_policy_document" "bastion" {
       "kms:DescribeKey",
     ]
     resources = [
-      # EBS/cluster KMS key — encrypts rke2 artifacts and cluster EBS
-      aws_kms_key.ebs.arn,
-      # Bootstrap state KMS key — encrypts tfstate bucket objects
-      # Referenced by ARN pattern since it lives in bootstrap state
       "arn:aws:kms:${var.aws_region}:${data.aws_caller_identity.current.account_id}:key/*",
     ]
   }
@@ -282,115 +275,4 @@ resource "aws_iam_instance_profile" "bastion" {
   name = "${var.cluster_name}-bastion-profile"
   role = aws_iam_role.bastion.name
   tags = local.tags
-}
-
-# ============================================================
-# KMS: EBS Volume Encryption Key
-# Managed here so it is destroyed cleanly with the prod root,
-# preventing AlreadyExists errors on destroy/recreate cycles.
-#
-# Key policy statements:
-#   1. Root account — prevents lock-out, allows IAM delegation
-#   2. AutoScaling encryption — required for ASG to launch
-#      instances with encrypted EBS volumes
-#   3. AutoScaling CreateGrant — restricted to AWS resources
-#   4. Key administrator — Terraform caller identity
-# ============================================================
-data "aws_iam_policy_document" "ebs_kms" {
-  statement {
-    sid    = "EnableRootAccountAccess"
-    effect = "Allow"
-
-    principals {
-      type        = "AWS"
-      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
-    }
-
-    actions   = ["kms:*"]
-    resources = ["*"]
-  }
-
-  statement {
-    sid    = "AllowAutoScalingEncryption"
-    effect = "Allow"
-
-    principals {
-      type = "AWS"
-      identifiers = [
-        "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
-      ]
-    }
-
-    actions = [
-      "kms:Encrypt",
-      "kms:Decrypt",
-      "kms:ReEncrypt*",
-      "kms:GenerateDataKey*",
-      "kms:DescribeKey",
-    ]
-    resources = ["*"]
-  }
-
-  statement {
-    sid    = "AllowAutoScalingCreateGrant"
-    effect = "Allow"
-
-    principals {
-      type = "AWS"
-      identifiers = [
-        "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
-      ]
-    }
-
-    actions   = ["kms:CreateGrant"]
-    resources = ["*"]
-
-    condition {
-      test     = "Bool"
-      variable = "kms:GrantIsForAWSResource"
-      values   = ["true"]
-    }
-  }
-
-  statement {
-    sid    = "AllowKeyAdministration"
-    effect = "Allow"
-
-    principals {
-      type        = "AWS"
-      identifiers = [data.aws_caller_identity.current.arn]
-    }
-
-    actions = [
-      "kms:Create*",
-      "kms:Describe*",
-      "kms:Enable*",
-      "kms:List*",
-      "kms:Put*",
-      "kms:Update*",
-      "kms:Revoke*",
-      "kms:Disable*",
-      "kms:Get*",
-      "kms:Delete*",
-      "kms:ScheduleKeyDeletion",
-      "kms:CancelKeyDeletion",
-    ]
-    resources = ["*"]
-  }
-}
-
-resource "aws_kms_key" "ebs" {
-  description             = "KMS key for RKE2 cluster EBS volume encryption (${var.cluster_name})"
-  deletion_window_in_days = 7
-  enable_key_rotation     = true
-  policy                  = data.aws_iam_policy_document.ebs_kms.json
-
-  tags = merge(local.tags, {
-    Name = "${var.cluster_name}-ebs-kms-key"
-  })
-}
-
-resource "aws_kms_alias" "ebs" {
-  name          = "alias/${var.cluster_name}-ebs"
-  target_key_id = aws_kms_key.ebs.key_id
 }

@@ -76,12 +76,11 @@ module "rke2" {
   instance_type = var.control_plane_instance_type
   servers       = var.control_plane_count
 
-  # Disk — encrypted with the KMS key created in environments/prod/iam.tf
+  # Disk — encrypted using the AWS default EBS KMS key (aws/ebs)
   block_device_mappings = {
-    size       = tostring(var.control_plane_disk_size_gb)
-    encrypted  = "true"
-    kms_key_id = var.ebs_kms_key_arn
-    type       = "gp3"
+    size      = tostring(var.control_plane_disk_size_gb)
+    encrypted = "true"
+    type      = "gp3"
   }
 
   # SSH
@@ -151,12 +150,11 @@ module "rke2_workers" {
     desired = var.worker_count
   }
 
-  # Disk — encrypted with the KMS key created in environments/prod/iam.tf
+  # Disk — encrypted using the AWS default EBS KMS key (aws/ebs)
   block_device_mappings = {
-    size       = tostring(var.worker_disk_size_gb)
-    encrypted  = "true"
-    kms_key_id = var.ebs_kms_key_arn
-    type       = "gp3"
+    size      = tostring(var.worker_disk_size_gb)
+    encrypted = "true"
+    type      = "gp3"
   }
 
   # SSH
@@ -191,15 +189,12 @@ module "rke2_workers" {
 
 # ============================================================
 # Application Network Load Balancer (Worker-Facing)
-# Sits in front of the 4 worker nodes for application traffic.
-# Uses an Elastic IP for a stable public address.
 # ============================================================
 resource "aws_lb" "app" {
   name               = "${var.cluster_name}-app-nlb"
   internal           = false
   load_balancer_type = "network"
 
-  # Use the pre-allocated EIP for a stable public IP
   subnet_mapping {
     subnet_id     = var.bastion_subnet_id
     allocation_id = var.worker_nlb_eip_id
@@ -213,7 +208,6 @@ resource "aws_lb" "app" {
   })
 }
 
-# Target Group — HTTP (80) to worker NodePort for ingress-nginx HTTP
 resource "aws_lb_target_group" "http" {
   name        = "${var.cluster_name}-tg-http"
   port        = 80
@@ -234,7 +228,6 @@ resource "aws_lb_target_group" "http" {
   })
 }
 
-# Target Group — HTTPS (443) to worker NodePort for ingress-nginx HTTPS
 resource "aws_lb_target_group" "https" {
   name        = "${var.cluster_name}-tg-https"
   port        = 443
@@ -255,7 +248,6 @@ resource "aws_lb_target_group" "https" {
   })
 }
 
-# NLB Listener: HTTP port 80 -> worker target group
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.app.arn
   port              = 80
@@ -267,7 +259,6 @@ resource "aws_lb_listener" "http" {
   }
 }
 
-# NLB Listener: HTTPS port 443 -> worker target group
 resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.app.arn
   port              = 443
@@ -279,7 +270,6 @@ resource "aws_lb_listener" "https" {
   }
 }
 
-# Attach worker ASG to the NLB target groups
 resource "aws_autoscaling_attachment" "workers_http" {
   autoscaling_group_name = module.rke2_workers.nodepool_id
   lb_target_group_arn    = aws_lb_target_group.http.arn

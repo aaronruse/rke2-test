@@ -7,16 +7,14 @@
 #
 # Objects stored:
 #   ssh/rke2_id_ed25519.pub   — SSH public key
-#   ssh/rke2_id_ed25519       — SSH private key (KMS encrypted)
+#   ssh/rke2_id_ed25519       — SSH private key
 #   kubeconfig/config         — Cluster kubeconfig (copied from
 #                               the rke2 module's S3 path)
 #   outputs/terraform.json    — Snapshot of all Terraform outputs
 #
-# ⚠️  PRIVATE KEY SECURITY NOTE:
-# The private key is stored encrypted at rest using the EBS
-# KMS key. Access is restricted to principals with both S3
-# GetObject permission on this bucket AND kms:Decrypt on the
-# EBS key. Never store the private key without encryption.
+# All objects are encrypted at rest using the bootstrap bucket's
+# default KMS key (alias/rke2-prod-tfstate), which is managed
+# in environments/bootstrap/main.tf.
 # ============================================================
 
 locals {
@@ -40,8 +38,8 @@ resource "aws_s3_object" "ssh_public_key" {
   key     = "ssh/rke2_id_ed25519.pub"
   content = local.ssh_public_key
 
+  # Encrypted by the bucket's default KMS key (bootstrap tfstate key)
   server_side_encryption = "aws:kms"
-  kms_key_id             = aws_kms_key.ebs.arn
 
   tags = merge(local.tags, {
     Name    = "rke2-ssh-public-key"
@@ -49,14 +47,14 @@ resource "aws_s3_object" "ssh_public_key" {
   })
 }
 
-# Upload the SSH private key — encrypted with the EBS KMS key
+# Upload the SSH private key
 resource "aws_s3_object" "ssh_private_key" {
   bucket  = local.tfstate_bucket
   key     = "ssh/rke2_id_ed25519"
   content = data.local_sensitive_file.ssh_private_key.content
 
+  # Encrypted by the bucket's default KMS key (bootstrap tfstate key)
   server_side_encryption = "aws:kms"
-  kms_key_id             = aws_kms_key.ebs.arn
 
   # Explicitly mark sensitive — prevents content appearing in plan output
   lifecycle {
@@ -87,7 +85,6 @@ resource "null_resource" "copy_kubeconfig" {
       aws s3 cp ${module.rke2.kubeconfig_path} \
         s3://${local.tfstate_bucket}/kubeconfig/config \
         --sse aws:kms \
-        --sse-kms-key-id ${aws_kms_key.ebs.arn} \
         --region ${var.aws_region}
     EOT
   }
@@ -112,16 +109,12 @@ resource "aws_s3_object" "tf_outputs" {
     control_plane_subnet_id = module.networking.control_plane_subnet_id
     worker_subnet_id        = module.networking.worker_subnet_id
     nat_gateway_public_ip   = module.networking.nat_gateway_public_ip
-    ebs_kms_key_arn         = aws_kms_key.ebs.arn
-    ebs_kms_key_id          = aws_kms_key.ebs.key_id
-    ebs_kms_key_alias       = aws_kms_alias.ebs.name
     ssh_public_key_s3_path  = "s3://${local.tfstate_bucket}/ssh/rke2_id_ed25519.pub"
     ssh_private_key_s3_path = "s3://${local.tfstate_bucket}/ssh/rke2_id_ed25519"
   })
 
   content_type           = "application/json"
   server_side_encryption = "aws:kms"
-  kms_key_id             = aws_kms_key.ebs.arn
 
   tags = merge(local.tags, {
     Name    = "terraform-outputs"

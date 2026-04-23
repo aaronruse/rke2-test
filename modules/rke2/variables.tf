@@ -105,19 +105,6 @@ variable "worker_disk_size_gb" {
 }
 
 # ============================================================
-# Encryption
-# ============================================================
-variable "ebs_kms_key_arn" {
-  description = <<-DESC
-    ARN of the KMS key used to encrypt all cluster EBS volumes.
-    Created in environments/prod/iam.tf and passed in here so the
-    key lifecycle is managed by the prod root, not this module.
-    This prevents KMS alias conflicts on destroy/recreate cycles.
-  DESC
-  type        = string
-}
-
-# ============================================================
 # SSH
 # ============================================================
 variable "ssh_public_key" {

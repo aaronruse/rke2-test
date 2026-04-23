@@ -36,10 +36,7 @@ TFSTATE_BUCKET="rke2-prod-tfstate-641275310402"
 S3_STATE_PREFIX="s3://${TFSTATE_BUCKET}/cluster-state"
 
 # ============================================================
-# Dependency check — aws CLI is required.
-# It is installed by scripts/bootstrap-rhel8.sh. If it is
-# missing, install it before running this script:
-#   See: https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2-linux.html
+# Dependency check
 # ============================================================
 if ! command -v aws &>/dev/null; then
   echo ""
@@ -98,12 +95,9 @@ echo "==> Worker ASG        : $WORKER_ASG"
 
 # ============================================================
 # WORKERS — cancel spot requests + terminate instances directly
-# One-time spot instances cannot be stopped via the ASG or
-# EC2 stop API. We must cancel the spot request first, then
-# terminate the instance.
 # ============================================================
 echo ""
-echo "==> [Workers] Saving current ASG sizes..."
+echo "==> [Workers] Reading current ASG sizes..."
 
 WORKER_DESIRED=$(aws autoscaling describe-auto-scaling-groups \
   --region "$REGION" \
@@ -123,8 +117,13 @@ WORKER_MAX=$(aws autoscaling describe-auto-scaling-groups \
   --query "AutoScalingGroups[0].MaxSize" \
   --output text)
 
-# Save worker ASG state locally and to S3
-cat > "$STATE_DIR/worker-asg-state.json" <<EOF
+# Only save state if the ASG is actually running — never overwrite good
+# state with zeros. If desired is already 0 the cluster was previously
+# stopped and state should already be saved from that run.
+if [ "$WORKER_DESIRED" -gt 0 ]; then
+  echo "==> [Workers] Saving ASG state (min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED)..."
+
+  cat > "$STATE_DIR/worker-asg-state.json" <<EOF
 {
   "asg_name": "$WORKER_ASG",
   "min": $WORKER_MIN,
@@ -133,11 +132,15 @@ cat > "$STATE_DIR/worker-asg-state.json" <<EOF
 }
 EOF
 
-aws s3 cp "$STATE_DIR/worker-asg-state.json" \
-  "${S3_STATE_PREFIX}/worker-asg-state.json" \
-  --region "$REGION" > /dev/null
+  aws s3 cp "$STATE_DIR/worker-asg-state.json" \
+    "${S3_STATE_PREFIX}/worker-asg-state.json" \
+    --region "$REGION" > /dev/null
 
-echo "      Saved locally and to s3: min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED"
+  echo "      Saved locally and to S3."
+else
+  echo "==> [Workers] ASG desired is already 0 — skipping state save to preserve previous values."
+  echo "      Existing saved state will be used by cluster-start.sh."
+fi
 
 # Ensure all ASG processes are resumed so the ASG can act
 echo "==> [Workers] Ensuring all ASG processes are resumed..."

@@ -41,15 +41,16 @@ TFSTATE_BUCKET="rke2-prod-tfstate-641275310402"
 S3_STATE_PREFIX="s3://${TFSTATE_BUCKET}/cluster-state"
 KUBECONFIG_PATH="$HOME/.kube/config"
 
+# Default worker sizes used as fallback if saved state is missing or zero
+DEFAULT_WORKER_MIN=4
+DEFAULT_WORKER_MAX=6
+DEFAULT_WORKER_DESIRED=4
+
 # How long to wait for workers to join before cleaning up ghost nodes.
-# Increase this if your CIS hardened AMI takes longer to bootstrap.
 WORKER_JOIN_WAIT_SECONDS=300
 
 # ============================================================
-# Dependency check — jq is required to parse saved ASG state.
-# It is installed by scripts/bootstrap-rhel8.sh. If it is
-# missing, install it before running this script:
-#   sudo dnf install -y jq
+# Dependency checks
 # ============================================================
 if ! command -v jq &>/dev/null; then
   echo ""
@@ -80,9 +81,6 @@ mkdir -p "$STATE_DIR"
 
 # ============================================================
 # Pull state files from S3
-# Downloads all cluster state files written by cluster-stop.sh
-# into the local state directory. Falls back gracefully to any
-# existing local files if S3 files are not present.
 # ============================================================
 echo "==> Syncing cluster state from S3..."
 
@@ -172,26 +170,45 @@ echo "      ASG processes resumed."
 
 # ============================================================
 # WORKERS — restore ASG to previous desired capacity
-# Fresh spot instances will launch and rejoin the cluster
-# automatically using the token in SSM Parameter Store.
 # ============================================================
 echo ""
 echo "==> [Workers] Restoring worker ASG..."
 
+WORKER_ASG=""
+WORKER_MIN=$DEFAULT_WORKER_MIN
+WORKER_MAX=$DEFAULT_WORKER_MAX
+WORKER_DESIRED=$DEFAULT_WORKER_DESIRED
+
 if [ -f "$STATE_DIR/worker-asg-state.json" ]; then
-  WORKER_ASG=$(jq -r '.asg_name' "$STATE_DIR/worker-asg-state.json")
-  WORKER_MIN=$(jq -r '.min' "$STATE_DIR/worker-asg-state.json")
-  WORKER_MAX=$(jq -r '.max' "$STATE_DIR/worker-asg-state.json")
-  WORKER_DESIRED=$(jq -r '.desired' "$STATE_DIR/worker-asg-state.json")
+  SAVED_ASG=$(jq -r '.asg_name' "$STATE_DIR/worker-asg-state.json")
+  SAVED_MIN=$(jq -r '.min' "$STATE_DIR/worker-asg-state.json")
+  SAVED_MAX=$(jq -r '.max' "$STATE_DIR/worker-asg-state.json")
+  SAVED_DESIRED=$(jq -r '.desired' "$STATE_DIR/worker-asg-state.json")
+
+  # Guard against saved state that was accidentally captured as zero.
+  # If desired is 0 the state file is stale — fall back to defaults.
+  if [ "$SAVED_DESIRED" -gt 0 ]; then
+    WORKER_ASG="$SAVED_ASG"
+    WORKER_MIN="$SAVED_MIN"
+    WORKER_MAX="$SAVED_MAX"
+    WORKER_DESIRED="$SAVED_DESIRED"
+    echo "      Using saved state: min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED"
+  else
+    echo "      WARNING: Saved state has desired=0 — this is stale state from a cluster"
+    echo "      that was already stopped when cluster-stop.sh ran. Falling back to defaults."
+    echo "      Using defaults: min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED"
+    WORKER_ASG="$SAVED_ASG"
+  fi
 else
-  echo "      No saved worker state found in S3 or locally — using defaults (min=4 max=6 desired=4)"
+  echo "      No saved worker state found — using defaults (min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED)"
+fi
+
+# If we still don't have an ASG name, look it up
+if [ -z "$WORKER_ASG" ]; then
   WORKER_ASG=$(aws autoscaling describe-auto-scaling-groups \
     --region "$REGION" \
     --query "AutoScalingGroups[?contains(Tags[?Key=='Project'].Value, '${CLUSTER_NAME}') && contains(AutoScalingGroupName, 'worker')].AutoScalingGroupName" \
     --output text)
-  WORKER_MIN=4
-  WORKER_MAX=6
-  WORKER_DESIRED=4
 fi
 
 echo "      Restoring $WORKER_ASG -> min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED"
@@ -206,7 +223,7 @@ aws autoscaling update-auto-scaling-group \
 echo "      Worker ASG restored. Spot instances launching and will rejoin cluster."
 
 # ============================================================
-# KUBECONFIG — fetch from S3 so we can run kubectl
+# KUBECONFIG — fetch from S3
 # ============================================================
 echo ""
 echo "==> [Kubeconfig] Fetching kubeconfig from S3..."
@@ -220,7 +237,7 @@ export KUBECONFIG="$KUBECONFIG_PATH"
 echo "      Kubeconfig saved to $KUBECONFIG_PATH"
 
 # ============================================================
-# WAIT FOR WORKERS — poll until expected number of Ready nodes
+# WAIT FOR WORKERS
 # ============================================================
 echo ""
 echo "==> [Workers] Waiting up to $((WORKER_JOIN_WAIT_SECONDS / 60)) minutes for $WORKER_DESIRED workers to join..."
@@ -250,7 +267,7 @@ if [ "$READY_COUNT" -lt "$WORKER_DESIRED" ]; then
 fi
 
 # ============================================================
-# GHOST NODE CLEANUP — remove NotReady nodes from previous run
+# GHOST NODE CLEANUP
 # ============================================================
 echo ""
 echo "==> [Cleanup] Removing NotReady ghost nodes from previous run..."
@@ -263,7 +280,6 @@ if [ -n "$GHOST_NODES" ]; then
   echo "$GHOST_NODES" | while read NODE; do
     echo "        - $NODE"
   done
-
   echo "$GHOST_NODES" | xargs -r kubectl delete node
   echo "      Ghost nodes removed."
 else

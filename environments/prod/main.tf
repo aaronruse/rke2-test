@@ -141,7 +141,7 @@ module "rke2" {
   control_plane_disk_size_gb  = var.control_plane_disk_size_gb
   worker_disk_size_gb         = var.worker_disk_size_gb
 
-  # SSH
+  # SSH — key content read from disk via ssh_keys.tf locals
   ssh_public_key = local.ssh_public_key
 
   # KMS key for EBS encryption — created in iam.tf
@@ -188,7 +188,7 @@ output "app_nlb_dns" {
 }
 
 output "kubeconfig_s3_path" {
-  description = "S3 path where the kubeconfig is stored in the tfstate bucket"
+  description = "S3 path where the kubeconfig is stored after cluster bootstrap"
   value       = "s3://${local.tfstate_bucket}/kubeconfig/config"
 }
 
@@ -217,6 +217,9 @@ output "nat_gateway_public_ip" {
   value       = module.networking.nat_gateway_public_ip
 }
 
+# ============================================================
+# KMS Outputs
+# ============================================================
 output "ebs_kms_key_arn" {
   description = "ARN of the KMS key used to encrypt all cluster EBS volumes"
   value       = aws_kms_key.ebs.arn
@@ -230,6 +233,19 @@ output "ebs_kms_key_id" {
 output "ebs_kms_key_alias" {
   description = "Alias of the KMS key used to encrypt all cluster EBS volumes"
   value       = aws_kms_alias.ebs.name
+}
+
+output "ebs_kms_key_policy" {
+  description = "The full JSON key policy attached to the EBS KMS key"
+  value       = aws_kms_key.ebs.policy
+}
+
+# ============================================================
+# S3 Outputs
+# ============================================================
+output "tfstate_bucket" {
+  description = "S3 bucket holding Terraform state, SSH keys, kubeconfig, and outputs"
+  value       = local.tfstate_bucket
 }
 
 output "ssh_public_key_s3_path" {
@@ -251,19 +267,20 @@ output "ssh_connect_instructions" {
   description = "How to SSH into cluster nodes via bastion"
   value       = <<-INSTRUCTIONS
     # ---- SSH Access Instructions ----
+
     # 1. Add your private key to the SSH agent (enables agent forwarding):
     ssh-add ~/.ssh/id_rsa   # or your actual private key path
 
     # 2. SSH into the bastion (ForwardAgent enables jumping to internal nodes):
     ssh -A ubuntu@${module.networking.bastion_eip_public_ip}
 
-    # 3. From the bastion, SSH into the control plane node:
+    # 3. From the bastion, SSH into the control plane node (get IP from AWS console or below):
     ssh ubuntu@<control-plane-private-ip>
 
     # 4. From the bastion, SSH into a worker node:
     ssh ubuntu@<worker-private-ip>
 
-    # ---- Fetch kubeconfig from S3 ----
+    # ---- Alternatively: kubectl via kubeconfig from S3 ----
     aws s3 cp s3://${local.tfstate_bucket}/kubeconfig/config ~/.kube/config \
       --region ${var.aws_region}
     export KUBECONFIG=~/.kube/config

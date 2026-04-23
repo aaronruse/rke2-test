@@ -38,8 +38,9 @@ worker_disk_size_gb         = 350
 # Subscribe to CIS Hardened Ubuntu 24.04 Level 1 in AWS Marketplace first:
 # https://aws.amazon.com/marketplace/pp/prodview-6l5e56nst6r3g
 # here is the CIS AMI=ami-004ca9c8986f68ab5
+# here is another CIS image=ami-0d76b909de1a0595d
 # Then replace this with the AMI ID for your region:
-ami_id = "ami-0d76b909de1a0595d"
+ami_id = "ami-0650f6c65227d92b1"
 
 # ------- SSH -------
 ssh_public_key_path = "~/.ssh/rke2_id_ed25519.pub"

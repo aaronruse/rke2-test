@@ -64,6 +64,10 @@ locals {
     Project     = var.cluster_name
     Environment = var.environment
   })
+
+  # Bucket name matches what bootstrap creates — must stay in sync
+  # with the bucket_name local in environments/bootstrap/main.tf
+  tfstate_bucket = "${var.cluster_name}-tfstate-${data.aws_caller_identity.current.account_id}"
 }
 
 # ============================================================
@@ -114,6 +118,10 @@ module "securitygroups" {
 
 # ============================================================
 # RKE2 Module
+# Control plane and workers use the locally generated node key
+# (aws_key_pair.node) — separate from the bastion key.
+# The node private key lives only on the local filesystem and
+# is never stored in Terraform state or S3.
 # ============================================================
 module "rke2" {
   source = "../../modules/rke2"
@@ -141,8 +149,9 @@ module "rke2" {
   control_plane_disk_size_gb  = var.control_plane_disk_size_gb
   worker_disk_size_gb         = var.worker_disk_size_gb
 
-  # SSH — key content read from disk via ssh_keys.tf locals
-  ssh_public_key = local.ssh_public_key
+  # SSH — node key generated locally, public key read from disk.
+  # Private key is never stored in state or S3.
+  ssh_public_key = data.local_file.node_ssh_public_key.content
 
   # RKE2
   rke2_version              = var.rke2_version
@@ -154,6 +163,58 @@ module "rke2" {
   service_cidr = var.service_cidr
 
   tags = local.tags
+}
+
+# ============================================================
+# Destroy-time precondition check
+# Fails terraform destroy with a clear message if the control
+# plane ASG still has suspended processes, which means the
+# cluster was stopped with cluster-stop.sh and not started
+# again. Destroying in this state causes the ASG drain to
+# hang until it times out.
+#
+# To destroy safely:
+#   1. bash scripts/cluster-start.sh
+#   2. terraform destroy
+# ============================================================
+resource "null_resource" "check_cluster_started_before_destroy" {
+  triggers = {
+    # Derive the CP ASG name from the worker nodepool ID by replacing
+    # "workers-agent" with "server" — same convention used in
+    # modules/rke2/outputs.tf. Both ASGs share the same random suffix.
+    cp_asg_name = replace(module.rke2.worker_nodepool_id, "workers-agent", "server")
+    region      = var.aws_region
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-EOT
+      SUSPENDED=$(aws autoscaling describe-auto-scaling-groups \
+        --region "${self.triggers.region}" \
+        --auto-scaling-group-names "${self.triggers.cp_asg_name}" \
+        --query "AutoScalingGroups[0].SuspendedProcesses[0].ProcessName" \
+        --output text)
+
+      if [ -n "$SUSPENDED" ] && [ "$SUSPENDED" != "None" ]; then
+        echo ""
+        echo "============================================================"
+        echo "ERROR: Cannot destroy — cluster is in a stopped state."
+        echo ""
+        echo "The control plane ASG has suspended processes, which means"
+        echo "cluster-stop.sh was run and the cluster has not been started"
+        echo "again. Destroying now will cause terraform to hang."
+        echo ""
+        echo "Start the cluster first, then destroy:"
+        echo "  bash scripts/cluster-start.sh"
+        echo "  terraform destroy"
+        echo "============================================================"
+        echo ""
+        exit 1
+      fi
+
+      echo "Cluster state check passed — control plane ASG processes are active."
+    EOT
+  }
 }
 
 # ============================================================
@@ -220,12 +281,12 @@ output "tfstate_bucket" {
 }
 
 output "ssh_public_key_s3_path" {
-  description = "S3 path of the uploaded SSH public key"
+  description = "S3 path of the uploaded bastion SSH public key"
   value       = "s3://${local.tfstate_bucket}/ssh/rke2_id_ed25519.pub"
 }
 
 output "ssh_private_key_s3_path" {
-  description = "S3 path of the uploaded SSH private key"
+  description = "S3 path of the uploaded bastion SSH private key"
   value       = "s3://${local.tfstate_bucket}/ssh/rke2_id_ed25519"
 }
 
@@ -234,22 +295,28 @@ output "tf_outputs_s3_path" {
   value       = "s3://${local.tfstate_bucket}/outputs/terraform.json"
 }
 
+output "node_ssh_key_path" {
+  description = "Local filesystem path of the generated node SSH private key"
+  value       = pathexpand(var.node_ssh_private_key_path)
+}
+
 output "ssh_connect_instructions" {
   description = "How to SSH into cluster nodes via bastion"
   value       = <<-INSTRUCTIONS
     # ---- SSH Access Instructions ----
 
-    # 1. Add your private key to the SSH agent (enables agent forwarding):
-    ssh-add ~/.ssh/rke2_id_ed25519
+    # Bastion uses your local key (~/.ssh/rke2_id_ed25519)
+    # Cluster nodes use the locally generated node key.
 
-    # 2. SSH into the bastion (ForwardAgent enables jumping to internal nodes):
+    # 1. Load both keys into the SSH agent:
+    ssh-add ~/.ssh/rke2_id_ed25519
+    ssh-add ${pathexpand(var.node_ssh_private_key_path)}
+
+    # 2. SSH into the bastion:
     ssh -A ubuntu@${module.networking.bastion_eip_public_ip}
 
-    # 3. From the bastion, SSH into the control plane node:
-    ssh ubuntu@<control-plane-private-ip>
-
-    # 4. From the bastion, SSH into a worker node:
-    ssh ubuntu@<worker-private-ip>
+    # 3. From the bastion, SSH into a control plane or worker node:
+    ssh ubuntu@<node-private-ip>
 
     # ---- Fetch kubeconfig from S3 ----
     aws s3 cp s3://${local.tfstate_bucket}/kubeconfig/config ~/.kube/config \

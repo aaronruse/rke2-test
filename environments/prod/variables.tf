@@ -143,23 +143,9 @@ variable "worker_disk_size_gb" {
 # ============================================================
 # AMI — CIS Hardened Ubuntu 24.04
 # ============================================================
-# Recommended: Use the official CIS Hardened Image (Level 1) for Ubuntu 24.04 LTS
-# from the AWS Marketplace by the Center for Internet Security.
-# Subscribe at: https://aws.amazon.com/marketplace/pp/prodview-6l5e56nst6r3g
-# After subscribing, look up the AMI ID for your region via:
-#   aws ec2 describe-images --owners aws-marketplace \
-#     --filters "Name=name,Values=*CIS*Ubuntu*24.04*" \
-#     --query "Images[*].{ID:ImageId,Name:Name}" --output table
-#
-# ⚠️  COMPATIBILITY NOTE: RKE2 v1.26 was built against older kernels.
-# Ubuntu 24.04 ships with kernel 6.8. This is known to work with the
-# containerd/runc shipped by RKE2 v1.26.15+rke2r1, but you should
-# validate in a non-prod environment first. If kernel issues arise,
-# consider Ubuntu 22.04 CIS (kernel 5.15) as a safer match.
 variable "ami_id" {
   description = "AMI ID for CIS Hardened Ubuntu 24.04 LTS (must be subscribed in AWS Marketplace)"
   type        = string
-  # Placeholder — replace with the AMI ID from your region after subscribing
   default     = "ami-REPLACE-WITH-CIS-UBUNTU-2404"
 }
 
@@ -167,9 +153,27 @@ variable "ami_id" {
 # SSH Access
 # ============================================================
 variable "ssh_public_key_path" {
-  description = "Path to the SSH public key file to inject into nodes"
+  description = <<-DESC
+    Path to the SSH public key file for bastion access.
+    The corresponding private key must be present on the machine
+    running Terraform. The public key is stored in S3 for auditing.
+    Default: ~/.ssh/rke2_id_ed25519.pub
+  DESC
   type        = string
   default     = "~/.ssh/rke2_id_ed25519.pub"
+}
+
+variable "node_ssh_private_key_path" {
+  description = <<-DESC
+    Path where Terraform will generate the SSH private key for
+    cluster node access (control plane and workers). The key is
+    generated on the local filesystem during apply and is never
+    stored in Terraform state or S3. The public key is derived
+    from this path by appending .pub and is registered in AWS.
+    Default: ~/.ssh/rke2_node_id_ed25519
+  DESC
+  type        = string
+  default     = "~/.ssh/rke2_node_id_ed25519"
 }
 
 # ============================================================

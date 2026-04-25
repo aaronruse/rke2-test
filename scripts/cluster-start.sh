@@ -1,32 +1,31 @@
 #!/bin/bash
 # ============================================================
 # cluster-start.sh
-# Starts the RKE2 cluster, handling spot and on-demand
-# instances differently:
+# Starts the RKE2 cluster:
+#
+#   Bastion (on-demand) — started directly.
 #
 #   Control plane (on-demand) — starts the stopped instance
 #     and resumes ASG processes. etcd and cluster state are
 #     fully intact from before the stop.
 #
-#   Workers (spot) — restores ASG to previous desired capacity.
-#     Fresh spot instances launch and automatically rejoin the
-#     cluster using the token in SSM Parameter Store.
-#
-#   Bastion (on-demand) — started directly.
+#   Workers (spot) — worker ASG was deleted by cluster-stop.sh.
+#     terraform apply is run to recreate it from state. Fresh
+#     spot instances launch and automatically rejoin the cluster
+#     using the token in SSM Parameter Store.
 #
 #   Ghost node cleanup — after new workers have joined, any
 #     NotReady nodes left over from the previous run are
 #     removed from the Kubernetes API server.
 #
-# State is pulled from s3://<tfstate-bucket>/cluster-state/
-# so any collaborator with AWS access can start the cluster,
-# regardless of which machine last ran cluster-stop.sh.
-# Falls back to ~/.rke2-cluster-state/ if S3 files are not found.
+# Reads state saved by cluster-stop.sh from S3 and
+# ~/.rke2-cluster-state/. terraform apply is run from
+# environments/prod/ relative to this script's location.
 #
-# Dependencies: aws CLI, jq
+# Dependencies: aws CLI, jq, terraform, kubectl
 #
-# Usage:
-#   bash scripts/cluster-start.sh
+# Usage (run from scripts/ directory):
+#   bash cluster-start.sh
 #
 # Allow 5-10 minutes after running for RKE2 to fully come
 # back up before running kubectl commands.
@@ -41,48 +40,38 @@ TFSTATE_BUCKET="rke2-prod-tfstate-641275310402"
 S3_STATE_PREFIX="s3://${TFSTATE_BUCKET}/cluster-state"
 KUBECONFIG_PATH="$HOME/.kube/config"
 
-# Default worker sizes used as fallback if saved state is missing or zero
-DEFAULT_WORKER_MIN=4
-DEFAULT_WORKER_MAX=6
-DEFAULT_WORKER_DESIRED=4
+# Path to environments/prod/ relative to scripts/
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TF_DIR="${SCRIPT_DIR}/../environments/prod"
 
-# How long to wait for workers to join before cleaning up ghost nodes.
+# How long to wait for workers to join before cleaning up ghost nodes
 WORKER_JOIN_WAIT_SECONDS=300
 
 # ============================================================
 # Dependency checks
 # ============================================================
-if ! command -v jq &>/dev/null; then
+MISSING=""
+for cmd in jq aws terraform kubectl; do
+  if ! command -v "$cmd" &>/dev/null; then
+    MISSING="$MISSING $cmd"
+  fi
+done
+
+if [ -n "$MISSING" ]; then
   echo ""
-  echo "ERROR: jq is not installed but is required by this script."
+  echo "ERROR: The following required tools are not installed:$MISSING"
   echo ""
-  echo "  jq is used to parse the saved worker ASG state from S3."
-  echo ""
-  echo "  Install it with:"
-  echo "    sudo dnf install -y jq"
-  echo ""
-  echo "  Or re-run the bootstrap script which installs it automatically:"
-  echo "    bash scripts/bootstrap-rhel8.sh"
+  echo "  Run the bootstrap script to install them:"
+  echo "    bash bootstrap-rhel8.sh"
   echo ""
   exit 1
 fi
-
-if ! command -v aws &>/dev/null; then
-  echo ""
-  echo "ERROR: aws CLI is not installed but is required by this script."
-  echo ""
-  echo "  Install it by running the bootstrap script:"
-  echo "    bash scripts/bootstrap-rhel8.sh"
-  echo ""
-  exit 1
-fi
-
-mkdir -p "$STATE_DIR"
 
 # ============================================================
 # Pull state files from S3
 # ============================================================
 echo "==> Syncing cluster state from S3..."
+mkdir -p "$STATE_DIR"
 
 for FILE in cp-instance-id.txt cp-asg-name.txt bastion-instance-id.txt worker-asg-state.json; do
   if aws s3 cp "${S3_STATE_PREFIX}/${FILE}" "$STATE_DIR/$FILE" \
@@ -169,58 +158,25 @@ aws autoscaling resume-processes \
 echo "      ASG processes resumed."
 
 # ============================================================
-# WORKERS — restore ASG to previous desired capacity
+# WORKERS — recreate ASG via terraform apply
+# The worker ASG was deleted by cluster-stop.sh. Terraform still
+# has the definition in state so apply will recreate it cleanly.
 # ============================================================
 echo ""
-echo "==> [Workers] Restoring worker ASG..."
+echo "==> [Workers] Recreating worker ASG via terraform apply..."
+echo "      Working directory: $TF_DIR"
 
-WORKER_ASG=""
-WORKER_MIN=$DEFAULT_WORKER_MIN
-WORKER_MAX=$DEFAULT_WORKER_MAX
-WORKER_DESIRED=$DEFAULT_WORKER_DESIRED
+cd "$TF_DIR"
 
-if [ -f "$STATE_DIR/worker-asg-state.json" ]; then
-  SAVED_ASG=$(jq -r '.asg_name' "$STATE_DIR/worker-asg-state.json")
-  SAVED_MIN=$(jq -r '.min' "$STATE_DIR/worker-asg-state.json")
-  SAVED_MAX=$(jq -r '.max' "$STATE_DIR/worker-asg-state.json")
-  SAVED_DESIRED=$(jq -r '.desired' "$STATE_DIR/worker-asg-state.json")
+terraform apply \
+  -target=module.rke2.module.rke2_workers.module.nodepool.aws_autoscaling_group.this \
+  -target=module.rke2.aws_autoscaling_attachment.workers_http \
+  -target=module.rke2.aws_autoscaling_attachment.workers_https \
+  -auto-approve
 
-  # Guard against saved state that was accidentally captured as zero.
-  # If desired is 0 the state file is stale — fall back to defaults.
-  if [ "$SAVED_DESIRED" -gt 0 ]; then
-    WORKER_ASG="$SAVED_ASG"
-    WORKER_MIN="$SAVED_MIN"
-    WORKER_MAX="$SAVED_MAX"
-    WORKER_DESIRED="$SAVED_DESIRED"
-    echo "      Using saved state: min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED"
-  else
-    echo "      WARNING: Saved state has desired=0 — this is stale state from a cluster"
-    echo "      that was already stopped when cluster-stop.sh ran. Falling back to defaults."
-    echo "      Using defaults: min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED"
-    WORKER_ASG="$SAVED_ASG"
-  fi
-else
-  echo "      No saved worker state found — using defaults (min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED)"
-fi
+echo "      Worker ASG recreated. Spot instances launching and will rejoin cluster."
 
-# If we still don't have an ASG name, look it up
-if [ -z "$WORKER_ASG" ]; then
-  WORKER_ASG=$(aws autoscaling describe-auto-scaling-groups \
-    --region "$REGION" \
-    --query "AutoScalingGroups[?contains(Tags[?Key=='Project'].Value, '${CLUSTER_NAME}') && contains(AutoScalingGroupName, 'worker')].AutoScalingGroupName" \
-    --output text)
-fi
-
-echo "      Restoring $WORKER_ASG -> min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED"
-
-aws autoscaling update-auto-scaling-group \
-  --region "$REGION" \
-  --auto-scaling-group-name "$WORKER_ASG" \
-  --min-size "$WORKER_MIN" \
-  --max-size "$WORKER_MAX" \
-  --desired-capacity "$WORKER_DESIRED"
-
-echo "      Worker ASG restored. Spot instances launching and will rejoin cluster."
+cd "$SCRIPT_DIR"
 
 # ============================================================
 # KUBECONFIG — fetch from S3
@@ -237,8 +193,13 @@ export KUBECONFIG="$KUBECONFIG_PATH"
 echo "      Kubeconfig saved to $KUBECONFIG_PATH"
 
 # ============================================================
-# WAIT FOR WORKERS
+# WAIT FOR WORKERS — poll until expected number of Ready nodes
 # ============================================================
+WORKER_DESIRED=4
+if [ -f "$STATE_DIR/worker-asg-state.json" ]; then
+  WORKER_DESIRED=$(jq -r '.desired' "$STATE_DIR/worker-asg-state.json")
+fi
+
 echo ""
 echo "==> [Workers] Waiting up to $((WORKER_JOIN_WAIT_SECONDS / 60)) minutes for $WORKER_DESIRED workers to join..."
 
@@ -268,22 +229,44 @@ fi
 
 # ============================================================
 # GHOST NODE CLEANUP
+# Wait until the API server is responding before attempting
+# to delete nodes — the control plane may still be warming up.
+# Errors are not suppressed so failures are visible.
 # ============================================================
 echo ""
-echo "==> [Cleanup] Removing NotReady ghost nodes from previous run..."
+echo "==> [Cleanup] Waiting for API server to be ready..."
 
-GHOST_NODES=$(kubectl get nodes --no-headers 2>/dev/null | \
-  awk '$2=="NotReady" {print $1}')
+API_READY=false
+for i in $(seq 1 20); do
+  if kubectl get nodes --no-headers > /dev/null 2>&1; then
+    API_READY=true
+    break
+  fi
+  echo "      API server not ready yet — retrying in 15s ($i/20)..."
+  sleep 15
+done
 
-if [ -n "$GHOST_NODES" ]; then
-  echo "      Found ghost nodes:"
-  echo "$GHOST_NODES" | while read NODE; do
-    echo "        - $NODE"
-  done
-  echo "$GHOST_NODES" | xargs -r kubectl delete node
-  echo "      Ghost nodes removed."
+if [ "$API_READY" = false ]; then
+  echo "      WARNING: API server did not become ready in time."
+  echo "      Run this manually once the cluster is up:"
+  echo "        kubectl get nodes --no-headers | awk '\$2==\"NotReady\" {print \$1}' | xargs kubectl delete node"
 else
-  echo "      No NotReady nodes found — cluster is clean."
+  echo "==> [Cleanup] Removing NotReady ghost nodes from previous run..."
+
+  GHOST_NODES=$(kubectl get nodes --no-headers | \
+    awk '$2=="NotReady" {print $1}')
+
+  if [ -n "$GHOST_NODES" ]; then
+    echo "      Found ghost nodes:"
+    echo "$GHOST_NODES" | while read NODE; do
+      echo "        - $NODE"
+    done
+
+    echo "$GHOST_NODES" | xargs -r kubectl delete node
+    echo "      Ghost nodes removed."
+  else
+    echo "      No NotReady nodes found — cluster is clean."
+  fi
 fi
 
 # ============================================================

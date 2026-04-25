@@ -8,12 +8,11 @@
 #     instance stopped. EBS volume and etcd data are preserved.
 #     On start, the same instance resumes exactly where it left off.
 #
-#   Workers (spot) — spot requests cancelled and instances
-#     terminated directly. One-time spot instances cannot be
-#     stopped via the ASG or EC2 stop API — they must be
-#     cancelled at the spot request level first, then terminated.
-#     Workers are stateless and will rejoin on start using the
-#     token stored in SSM by the rancherfederal module.
+#   Workers (spot) — spot requests cancelled, instances terminated,
+#     and the worker ASG deleted entirely. Deleting the ASG means
+#     terraform destroy will not hang waiting for it to drain.
+#     The ASG definition remains in Terraform state so that
+#     cluster-start.sh can recreate it cleanly via terraform apply.
 #
 #   Bastion (on-demand) — stopped directly.
 #
@@ -21,10 +20,14 @@
 # s3://<tfstate-bucket>/cluster-state/ so that collaborators
 # can start the cluster from any machine with AWS access.
 #
-# Dependencies: aws CLI (no jq required — state is written via heredoc)
+# ⚠️  IMPORTANT: Always run cluster-start.sh before terraform destroy.
+#     The CP ASG processes are suspended by this script. If you run
+#     terraform destroy without starting first it will hang.
 #
-# Usage:
-#   bash scripts/cluster-stop.sh
+# Dependencies: aws CLI (no jq required)
+#
+# Usage (run from scripts/ directory):
+#   bash cluster-stop.sh
 # ============================================================
 
 set -euo pipefail
@@ -43,7 +46,7 @@ if ! command -v aws &>/dev/null; then
   echo "ERROR: aws CLI is not installed but is required by this script."
   echo ""
   echo "  Install it by running the bootstrap script:"
-  echo "    bash scripts/bootstrap-rhel8.sh"
+  echo "    bash bootstrap-rhel8.sh"
   echo ""
   exit 1
 fi
@@ -94,11 +97,14 @@ echo "==> Control plane ASG : $CP_ASG"
 echo "==> Worker ASG        : $WORKER_ASG"
 
 # ============================================================
-# WORKERS — cancel spot requests + terminate instances directly
+# WORKERS — cancel spot requests, terminate instances, delete ASG
+# The ASG is deleted entirely so terraform destroy does not hang
+# waiting for it to drain. The ASG definition remains in Terraform
+# state so cluster-start.sh can recreate it via terraform apply.
 # ============================================================
 echo ""
-echo "==> [Workers] Reading current ASG sizes..."
 
+# Save worker ASG config before deleting it so start knows what to recreate
 WORKER_DESIRED=$(aws autoscaling describe-auto-scaling-groups \
   --region "$REGION" \
   --auto-scaling-group-names "$WORKER_ASG" \
@@ -117,9 +123,6 @@ WORKER_MAX=$(aws autoscaling describe-auto-scaling-groups \
   --query "AutoScalingGroups[0].MaxSize" \
   --output text)
 
-# Only save state if the ASG is actually running — never overwrite good
-# state with zeros. If desired is already 0 the cluster was previously
-# stopped and state should already be saved from that run.
 if [ "$WORKER_DESIRED" -gt 0 ]; then
   echo "==> [Workers] Saving ASG state (min=$WORKER_MIN max=$WORKER_MAX desired=$WORKER_DESIRED)..."
 
@@ -139,7 +142,6 @@ EOF
   echo "      Saved locally and to S3."
 else
   echo "==> [Workers] ASG desired is already 0 — skipping state save to preserve previous values."
-  echo "      Existing saved state will be used by cluster-start.sh."
 fi
 
 # Ensure all ASG processes are resumed so the ASG can act
@@ -149,7 +151,7 @@ aws autoscaling resume-processes \
   --auto-scaling-group-name "$WORKER_ASG" \
   --scaling-processes HealthCheck Launch Terminate ReplaceUnhealthy AZRebalance AlarmNotification ScheduledActions
 
-# Scale ASG to 0 first so it won't launch replacements
+# Scale to 0 first so the ASG won't launch replacements during deletion
 echo "==> [Workers] Scaling ASG to 0..."
 aws autoscaling update-auto-scaling-group \
   --region "$REGION" \
@@ -203,6 +205,16 @@ if [ -n "$WORKER_INSTANCE_IDS" ]; then
 else
   echo "      No running worker instances found."
 fi
+
+# Delete the worker ASG entirely
+echo "==> [Workers] Deleting worker ASG..."
+aws autoscaling delete-auto-scaling-group \
+  --region "$REGION" \
+  --auto-scaling-group-name "$WORKER_ASG" \
+  --force-delete
+
+echo "      Worker ASG deleted. Terraform state still holds the definition"
+echo "      so cluster-start.sh can recreate it via terraform apply."
 
 # ============================================================
 # CONTROL PLANE — suspend ASG + stop instance
@@ -273,8 +285,12 @@ fi
 echo ""
 echo "==> Cluster stopped successfully."
 echo "    Control plane EBS/etcd data is preserved."
-echo "    Workers terminated cleanly (stateless — this is fine)."
+echo "    Worker ASG deleted — will be recreated by cluster-start.sh."
 echo "    State files saved to: ${S3_STATE_PREFIX}/"
 echo ""
-echo "    To restart the cluster run:"
-echo "      bash scripts/cluster-start.sh"
+echo "    To restart the cluster run (from scripts/ directory):"
+echo "      bash cluster-start.sh"
+echo ""
+echo "    ⚠️  To destroy the cluster, start it first then destroy:"
+echo "      bash cluster-start.sh"
+echo "      cd ../environments/prod && terraform destroy"

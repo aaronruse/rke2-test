@@ -3,7 +3,8 @@
 #
 # The S3 bucket itself lives in environments/bootstrap/main.tf
 # and is managed there. This file only writes objects into
-# the existing bucket using the shared bucket name local.
+# the existing bucket. The bucket name is defined as
+# local.tfstate_bucket in main.tf.
 #
 # Objects stored:
 #   ssh/rke2_id_ed25519.pub   — SSH public key
@@ -18,10 +19,6 @@
 # ============================================================
 
 locals {
-  # Bucket name matches what bootstrap creates — must stay in sync
-  # with the bucket_name local in environments/bootstrap/main.tf
-  tfstate_bucket = "${var.cluster_name}-tfstate-${data.aws_caller_identity.current.account_id}"
-
   # Derive private key path from the public key path variable by
   # stripping the .pub suffix
   ssh_private_key_path = replace(pathexpand(var.ssh_public_key_path), ".pub", "")
